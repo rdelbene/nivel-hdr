@@ -54,6 +54,7 @@ class HdrTunerActivity : Activity() {
 
     private lateinit var levelLabel: TextView
     private lateinit var autoBtn: TextView
+    private lateinit var addBtn: TextView
     private lateinit var status: TextView
     private lateinit var grid: GridView
     private lateinit var btnReplace: TextView
@@ -116,8 +117,9 @@ class HdrTunerActivity : Activity() {
             setTextColor(Color.WHITE)
         })
         root.addView(TextView(this).apply {
-            text = "Elegí fotos de la cámara de Motorola y cuánta luz extra querés que agregue el Ultra HDR. " +
-                "La imagen no se toca: solo cambia la intensidad, y se puede volver a cambiar cuando quieras."
+            text = "Elegí cuánta luz extra querés que agregue el Ultra HDR. La imagen no se toca: solo cambia la intensidad, " +
+                "y se puede volver a cambiar cuando quieras. A las fotos que no lo traen (x0.5, x3, frontal) se les agrega " +
+                "con la misma curva que usa Motorola en la x1."
             textSize = 13f
             setTextColor(Color.LTGRAY)
             setPadding(0, dp(4), 0, dp(10))
@@ -142,6 +144,8 @@ class HdrTunerActivity : Activity() {
         // automático: el nivel elegido se aplica solo a cada foto nueva de la cámara
         autoBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { toggleAuto() }
         root.addView(autoBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        addBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { AutoHdr.setAdd(this, !AutoHdr.addOn(this)); updateAuto() }
+        root.addView(addBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
         updateAuto()
 
         status = TextView(this).apply {
@@ -210,6 +214,11 @@ class HdrTunerActivity : Activity() {
             else "Automático: apagado · tocá para aplicar este nivel a cada foto nueva"
         (autoBtn.background as GradientDrawable).setColor(if (on) Color.rgb(0, 224, 150) else Color.argb(255, 50, 50, 50))
         autoBtn.setTextColor(if (on) Color.BLACK else Color.WHITE)
+        if (::addBtn.isInitialized) {
+            val add = AutoHdr.addOn(this)
+            addBtn.text = if (add) "Agregar Ultra HDR a x0.5, x3 y frontal: SÍ" else "Agregar Ultra HDR a x0.5, x3 y frontal: NO"
+            (addBtn.background as GradientDrawable).setColor(if (add && on) Color.rgb(0, 160, 110) else Color.argb(255, 50, 50, 50))
+        }
     }
 
     private fun updateLevel() {
@@ -354,15 +363,21 @@ class HdrTunerActivity : Activity() {
         val t = target
         status.text = "Procesando ${list.size} foto(s)..."
         io.execute {
-            var ok = 0; var noHdr = 0; var fail = 0
+            var ok = 0; var noHdr = 0; var fail = 0; var added = 0
             var before = 0.0
             for (u in list) {
                 try {
                     val src = contentResolver.openInputStream(u)?.use { it.readBytes() } ?: throw IllegalStateException("sin datos")
                     val info = UltraHdrTuner.analyze(src)
-                    if (info == null) { noHdr++; continue }
-                    before = info.maxBoost
-                    val out = UltraHdrTuner.setMaxBoost(src, t) ?: run { noHdr++; null } ?: continue
+                    val out: ByteArray
+                    if (info == null) {
+                        // sin Ultra HDR (x3, x0.5, frontal): se le agrega con la curva de la stock
+                        out = AutoHdr.addGainMapBytes(src, t) ?: run { noHdr++; null } ?: continue
+                        added++
+                    } else {
+                        before = info.maxBoost
+                        out = UltraHdrTuner.setMaxBoost(src, t) ?: run { noHdr++; null } ?: continue
+                    }
                     if (replace) {
                         contentResolver.openOutputStream(u, "wt")?.use { it.write(out) } ?: throw IllegalStateException("no se pudo escribir")
                         // el nivel también queda en el nombre de la foto
@@ -386,7 +401,8 @@ class HdrTunerActivity : Activity() {
                 status.text = buildString {
                     append(if (replace) "Reemplazadas: $ok" else "Copias guardadas: $ok")
                     if (ok > 0 && before > 0) append(" (antes ×%.2f, ahora ×%.2f)".format(before, t))
-                    if (noHdr > 0) append(" · sin Ultra HDR: $noHdr")
+                    if (added > 0) append(" · con Ultra HDR agregado: $added")
+                    if (noHdr > 0) append(" · no se pudieron tocar: $noHdr")
                     if (fail > 0) append(" · con error: $fail")
                     if (replace && ok > 0) append("\nSi la galería muestra la versión vieja, cerrala y volvé a abrirla.")
                 }

@@ -25,6 +25,10 @@ object AutoHdr {
     private const val JOB_ID = 4931
     private const val PREFS = "cfg"
 
+    /** Agregar Ultra HDR a las fotos que llegan sin él (x3, x0.5, frontal). Prendido por defecto. */
+    fun addOn(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("autoAdd", true)
+    fun setAdd(ctx: Context, on: Boolean) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("autoAdd", on).apply()
+
     fun isOn(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("autoOn", false)
     fun level(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat("tuneBoost", 2.5f).toDouble()
     fun canWrite() = Environment.isExternalStorageManager()
@@ -80,7 +84,10 @@ object AutoHdr {
                 if (!ours && mime == "image/jpeg" && rel.startsWith("DCIM/") && path != null) {
                     try {
                         val f = File(path)
-                        val adjusted = adjustFile(f, target)
+                        waitStable(f)
+                        var adjusted = adjustFile(f, target)
+                        // sin Ultra HDR (x3, x0.5, frontal): se le agrega con la curva de la stock
+                        if (!adjusted && addOn(ctx) && rel.startsWith("DCIM/Camera")) adjusted = addToFile(f, target)
                         if (adjusted) changed++
                         // el nivel queda en el nombre (solo si la foto es Ultra HDR)
                         val newPath = if (adjusted || UltraHdrTuner.analyze(f.readBytes()) != null) renameWithLevel(ctx, id, f, target) else null
@@ -124,9 +131,8 @@ object AutoHdr {
         return null // el escaneo de arriba ya avisa de las dos rutas
     }
 
-    /** Reescribe en el lugar solo los bytes que cambian. */
-    fun adjustFile(f: File, target: Double): Boolean {
-        // esperar a que el archivo deje de crecer (la cámara puede seguir escribiendo)
+    /** Espera a que el archivo deje de crecer (la cámara puede seguir escribiendo). */
+    fun waitStable(f: File) {
         var size = f.length()
         for (k in 0 until 10) {
             Thread.sleep(300)
@@ -134,6 +140,40 @@ object AutoHdr {
             if (s2 == size && s2 > 0) break
             size = s2
         }
+    }
+
+    /**
+     * Arma el archivo con Ultra HDR para una foto que no lo tiene (la imagen principal no se recomprime).
+     * Null si ya tiene, si es foto en movimiento o si no se pudo.
+     */
+    fun addGainMapBytes(src: ByteArray, target: Double): ByteArray? {
+        if (UltraHdrTuner.analyze(src) != null) return null
+        val opt = android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 } // gain map a 1/4, como la stock
+        val small = android.graphics.BitmapFactory.decodeByteArray(src, 0, src.size, opt) ?: return null
+        val w = small.width; val h = small.height
+        val px = IntArray(w * h)
+        small.getPixels(px, 0, w, 0, 0, w, h)
+        small.recycle()
+        val gm = GainMapAdder.gainMapFromSmall(px, w, h)
+        for (i in px.indices) { val v = gm[i].toInt() and 255; px[i] = (0xff shl 24) or (v shl 16) or (v shl 8) or v }
+        val gbmp = android.graphics.Bitmap.createBitmap(px, w, h, android.graphics.Bitmap.Config.ARGB_8888)
+        val bos = java.io.ByteArrayOutputStream()
+        gbmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, bos)
+        gbmp.recycle()
+        val stops = Math.log(target.coerceAtLeast(1.0)) / Math.log(2.0)
+        return GainMapAdder.build(src, bos.toByteArray(), stops)
+    }
+
+    /** Agrega Ultra HDR al archivo (cambia de tamaño: se reescribe entero). */
+    fun addToFile(f: File, target: Double): Boolean {
+        val src = f.readBytes()
+        val out = addGainMapBytes(src, target) ?: return false
+        java.io.FileOutputStream(f).use { it.write(out); it.fd.sync() }
+        return true
+    }
+
+    /** Reescribe en el lugar solo los bytes que cambian. */
+    fun adjustFile(f: File, target: Double): Boolean {
         val src = f.readBytes()
         val info = UltraHdrTuner.analyze(src) ?: return false
         if (kotlin.math.abs(info.maxBoost - target) < 0.02) return false
