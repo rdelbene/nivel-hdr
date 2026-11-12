@@ -56,7 +56,6 @@ class HdrTunerActivity : Activity() {
     private lateinit var autoBtn: TextView
     private lateinit var summary: TextView
     private lateinit var filterBtn: TextView
-    private lateinit var btnShare: TextView
     private lateinit var levelBar: SeekBar
     private var onlyPending = false
     private val allItems = mutableListOf<Uri>()
@@ -193,11 +192,9 @@ class HdrTunerActivity : Activity() {
         root.addView(grid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(10), 0, 0) }
-        btnShare = pillButton("Compartir", Color.argb(255, 50, 50, 50), Color.WHITE) { share() }
-        row.addView(btnShare, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
-        btnCopy = pillButton("Copia", Color.argb(255, 50, 50, 50), Color.WHITE) { apply(false) }
+        btnCopy = pillButton("Guardar copia", Color.argb(255, 50, 50, 50), Color.WHITE) { apply(false) }
         btnReplace = pillButton("Reemplazar", Color.rgb(0, 224, 150), Color.BLACK) { apply(true) }
-        row.addView(btnCopy, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6); rightMargin = dp(6) })
+        row.addView(btnCopy, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
         row.addView(btnReplace, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6) })
         root.addView(row)
         setContentView(root)
@@ -269,8 +266,7 @@ class HdrTunerActivity : Activity() {
         btnCopy.alpha = if (n > 0) 1f else 0.4f
         btnReplace.alpha = if (n > 0) 1f else 0.4f
         btnReplace.text = if (n > 0) "Reemplazar ($n)" else "Reemplazar"
-        btnCopy.text = if (n > 0) "Copia ($n)" else "Copia"
-        btnShare.alpha = if (n > 0) 1f else 0.4f
+        btnCopy.text = if (n > 0) "Guardar copia ($n)" else "Guardar copia"
     }
 
     private inner class ThumbAdapter : BaseAdapter() {
@@ -503,17 +499,18 @@ class HdrTunerActivity : Activity() {
         adapter.notifyDataSetChanged()
     }
 
-    /** Nivel actual leyendo solo el encabezado y el comienzo del gain map (rápido aunque la foto pese mucho). */
+    /** Nivel actual leyendo solo los encabezados y el comienzo del gain map (rápido aunque la foto pese mucho). */
     private fun readLevel(u: Uri): Double? {
         contentResolver.openFileDescriptor(u, "r")?.use { pfd ->
             java.io.FileInputStream(pfd.fileDescriptor).channel.use { ch ->
-                val head = java.nio.ByteBuffer.allocate(minOf(ch.size(), 262144L).toInt())
-                ch.read(head, 0)
-                val hb = head.array()
-                val off = GainMapAdder.primaryLength(hb) ?: return null
-                val gm = java.nio.ByteBuffer.allocate(minOf(8192L, ch.size() - off).toInt().coerceAtLeast(0))
-                ch.read(gm, off.toLong())
-                return UltraHdrTuner.analyze(gm.array())?.maxBoost
+                val size = ch.size()
+                val read: (Long, Int) -> ByteArray = { p, n ->
+                    val buf = java.nio.ByteBuffer.allocate(minOf(n.toLong(), (size - p).coerceAtLeast(0)).toInt())
+                    while (buf.hasRemaining() && ch.read(buf, p + buf.position()) > 0) {}
+                    buf.array().copyOf(buf.position())
+                }
+                val off = GainMapAdder.primaryLength(size, read) ?: return null
+                return UltraHdrTuner.analyze(read(off.toLong(), 16384))?.maxBoost
             }
         }
         return null
@@ -590,59 +587,6 @@ class HdrTunerActivity : Activity() {
         io.execute {
             val n = AutoHdr.revertAll(this) { k, total -> main.post { status.text = "Volviendo atrás... $k de $total" } }
             main.post { status.text = "Listo: $n foto(s) quedaron como las guardó la cámara."; loadRecent() }
-        }
-    }
-
-    // ------------------------------------------------------------------ compartir
-
-    private fun share() {
-        val list = selected.toList()
-        if (list.isEmpty()) { status.text = "Primero elegí una o más fotos."; return }
-        android.app.AlertDialog.Builder(this)
-            .setTitle("Compartir ${list.size} foto(s)")
-            .setItems(arrayOf(
-                "Con Ultra HDR (en WhatsApp elegí enviar como Documento)",
-                "Sin Ultra HDR (se ve igual en cualquier celular)"
-            )) { _, which -> if (which == 0) sendUris(list) else shareSdr(list) }
-            .show()
-    }
-
-    private fun sendUris(list: List<Uri>) {
-        val i = if (list.size == 1) Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_STREAM, list[0])
-            else Intent(Intent.ACTION_SEND_MULTIPLE).putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(list))
-        i.type = "image/jpeg"
-        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        startActivity(Intent.createChooser(i, "Compartir"))
-    }
-
-    /** Copias sin Ultra HDR en Pictures/Nivel HDR (se borran las de la vez anterior) y se comparten esas. */
-    private fun shareSdr(list: List<Uri>) {
-        status.text = "Preparando copias sin Ultra HDR..."
-        io.execute {
-            try {
-                contentResolver.delete(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?", arrayOf("Pictures/Nivel HDR%"))
-            } catch (_: Exception) {}
-            val out = ArrayList<Uri>()
-            for (u in list) {
-                try {
-                    val src = contentResolver.openInputStream(u)?.use { it.readBytes() } ?: continue
-                    val name = contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
-                        ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: "foto.jpg"
-                    val v = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, name.substringBeforeLast('.') + "_SDR.jpg")
-                        put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Nivel HDR")
-                    }
-                    val nu = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: continue
-                    contentResolver.openOutputStream(nu)?.use { it.write(HdrEngine.sdrCopy(src)) }
-                    out += nu
-                } catch (_: Exception) {}
-            }
-            main.post {
-                status.text = "Listo para compartir: ${out.size} foto(s) sin Ultra HDR."
-                if (out.isNotEmpty()) sendUris(out)
-            }
         }
     }
 

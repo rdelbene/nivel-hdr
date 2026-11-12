@@ -165,44 +165,85 @@ object GainMapAdder {
 
     class Marks(val added: Boolean, val style: String)
 
-    /** Lee la marca propia (null si el Ultra HDR es el original de la cámara). */
+    /**
+     * Recorre los segmentos del encabezado (hasta SOS) leyendo solo lo necesario: [read] devuelve los bytes
+     * pedidos (posición, largo). Sirve para el archivo entero en memoria y para leer del disco por partes:
+     * las fotos de la cámara traen bloques grandes del chip (cientos de KB) antes del XMP y del MPF.
+     */
+    fun walk(size: Long, read: (Long, Int) -> ByteArray, visit: (marker: Int, pos: Long, len: Int) -> Boolean) {
+        var pos = 2L
+        while (pos + 4 <= size) {
+            val h = read(pos, 4)
+            if (h.size < 4 || (h[0].toInt() and 255) != 0xff) return
+            val m = h[1].toInt() and 255
+            if (m == 0xda || m == 0xd9) return
+            val len = ((h[2].toInt() and 255) shl 8) or (h[3].toInt() and 255)
+            if (!visit(m, pos, len)) return
+            pos += 2 + len
+        }
+    }
+
+    private fun arrReader(b: ByteArray): (Long, Int) -> ByteArray = { p, n ->
+        val a = p.toInt().coerceIn(0, b.size); b.copyOfRange(a, minOf(b.size, a + n))
+    }
+
+    /** Lee la marca propia (null si el Ultra HDR es el original de la cámara o si no tiene). */
     fun marks(b: ByteArray): Marks? {
-        val lim = minOf(b.size, 200_000)
-        val s = String(b, 0, lim, Charsets.ISO_8859_1)
-        if (!s.contains(NS)) return null
-        val added = Regex("nivelhdr:Added=\"(\\w+)\"").find(s)?.groupValues?.get(1) == "True"
-        val style = Regex("nivelhdr:Style=\"(\\w+)\"").find(s)?.groupValues?.get(1) ?: "stock"
-        return Marks(added, style)
+        var res: Marks? = null
+        walk(b.size.toLong(), arrReader(b)) { m, pos, len ->
+            val p = pos.toInt()
+            if (m == 0xe1 && startsWith(b, p + 4, XMP_NS) && contains(b, p, p + 2 + len, NS.toByteArray())) {
+                val s = String(b, p, minOf(len + 2, b.size - p), Charsets.ISO_8859_1)
+                val added = Regex("nivelhdr:Added=\"(\\w+)\"").find(s)?.groupValues?.get(1) == "True"
+                val style = Regex("nivelhdr:Style=\"(\\w+)\"").find(s)?.groupValues?.get(1) ?: "stock"
+                res = Marks(added, style); false
+            } else true
+        }
+        return res
+    }
+
+    /** Largo de la imagen principal leyendo del disco por partes (para la grilla). */
+    fun primaryLength(size: Long, read: (Long, Int) -> ByteArray): Int? {
+        var res: Int? = null
+        walk(size, read) { m, pos, len ->
+            if (m == 0xe2 && len in 12..4096) {
+                val seg = read(pos, len + 2)
+                if (startsWith(seg, 4, MPF_TAG)) { res = primaryLength(seg, 0); false } else true
+            } else true
+        }
+        return res
     }
 
     /** Largo de la imagen principal según el MPF (o null si no hay). */
     fun primaryLength(b: ByteArray): Int? {
-        var i = 2
-        while (i + 4 <= b.size && (b[i].toInt() and 255) == 0xff) {
-            val m = b[i + 1].toInt() and 255
-            if (m == 0xda) break
-            val len = ((b[i + 2].toInt() and 255) shl 8) or (b[i + 3].toInt() and 255)
-            if (m == 0xe2 && startsWith(b, i + 4, MPF_TAG)) {
-                val t = i + 8
-                val big = b[t] == 'M'.code.toByte()
-                fun u32(p: Int): Long = if (big)
-                    ((b[p].toLong() and 255) shl 24) or ((b[p + 1].toLong() and 255) shl 16) or ((b[p + 2].toLong() and 255) shl 8) or (b[p + 3].toLong() and 255)
-                else ((b[p + 3].toLong() and 255) shl 24) or ((b[p + 2].toLong() and 255) shl 16) or ((b[p + 1].toLong() and 255) shl 8) or (b[p].toLong() and 255)
-                fun u16(p: Int): Int = if (big) ((b[p].toInt() and 255) shl 8) or (b[p + 1].toInt() and 255) else ((b[p + 1].toInt() and 255) shl 8) or (b[p].toInt() and 255)
-                val ifd = t + u32(t + 4).toInt()
-                val n = u16(ifd)
-                for (k in 0 until n) {
-                    val e = ifd + 2 + k * 12
-                    if (u16(e) == 0xb002) {
-                        val entries = t + u32(e + 8).toInt()
-                        return u32(entries + 4).toInt().takeIf { it in 4..b.size }
-                    }
-                }
-                return null
-            }
-            i += 2 + len
+        var res: Int? = null
+        walk(b.size.toLong(), arrReader(b)) { m, pos, len ->
+            if (m == 0xe2 && startsWith(b, pos.toInt() + 4, MPF_TAG)) { res = primaryLength(b, pos.toInt()); false } else true
         }
-        return null
+        return res?.takeIf { it in 4..b.size }
+    }
+
+    /** Lee el tamaño de la primera imagen del segmento MPF que empieza en [segPos] (FF E2 LL LL "MPF\0" TIFF...). */
+    private fun primaryLength(b: ByteArray, segPos: Int): Int? {
+        val t = segPos + 8
+        if (t + 8 > b.size) return null
+        val big = b[t] == 'M'.code.toByte()
+        fun u32(p: Int): Long = if (big)
+            ((b[p].toLong() and 255) shl 24) or ((b[p + 1].toLong() and 255) shl 16) or ((b[p + 2].toLong() and 255) shl 8) or (b[p + 3].toLong() and 255)
+        else ((b[p + 3].toLong() and 255) shl 24) or ((b[p + 2].toLong() and 255) shl 16) or ((b[p + 1].toLong() and 255) shl 8) or (b[p].toLong() and 255)
+        fun u16(p: Int): Int = if (big) ((b[p].toInt() and 255) shl 8) or (b[p + 1].toInt() and 255) else ((b[p + 1].toInt() and 255) shl 8) or (b[p].toInt() and 255)
+        return try {
+            val ifd = t + u32(t + 4).toInt()
+            val n = u16(ifd)
+            for (k in 0 until n) {
+                val e = ifd + 2 + k * 12
+                if (u16(e) == 0xb002) {
+                    val entries = t + u32(e + 8).toInt()
+                    return u32(entries + 4).toInt().takeIf { it > 4 }
+                }
+            }
+            null
+        } catch (_: IndexOutOfBoundsException) { null }
     }
 
     /**

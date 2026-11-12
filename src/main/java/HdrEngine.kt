@@ -169,7 +169,4 @@ object HdrEngine {
         val g = gainJpeg(plain, false) ?: return null
         return GainMapAdder.build(plain, g, STOCK_STOPS, added = false, style = "stock")
     }
-
-    /** Copia sin Ultra HDR para compartir (JPEG común). */
-    fun sdrCopy(src: ByteArray): ByteArray = if (UltraHdrTuner.analyze(src) != null) GainMapAdder.strip(src) ?: src else src
 }
