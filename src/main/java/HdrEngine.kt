@@ -139,7 +139,9 @@ object HdrEngine {
         val st = styleOverride ?: style(ctx)
         val curStyle = marks?.style ?: "stock"
         val stops = ln(plan.boost) / ln(2.0)
-        if (info != null && st == curStyle) {
+        // curva vieja de "solo las luces": se rehace con la nueva
+        val oldCurve = marks != null && marks.style == "luces" && marks.curve < GainMapAdder.CURVE_VERSION
+        if (info != null && st == curStyle && !oldCurve) {
             // mismo estilo: solo cambia la intensidad, en el lugar
             if (kotlin.math.abs(info.maxBoost - plan.boost) < 0.02) return Result(src, plan.boost, plan.lens, plan.scene, "igual")
             val out = UltraHdrTuner.setMaxBoost(src, plan.boost) ?: return null

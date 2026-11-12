@@ -20,8 +20,10 @@ object GainMapAdder {
     private val STOCK_GAIN_Y = floatArrayOf(0f, 0f, 3f, 56f, 82f, 96f, 105f, 111f, 121f, 138f, 155f, 185f, 210f, 241f, 255f, 255f)
 
     // estilo "solo las luces": la foto queda como una normal y brillan cielo, lámparas y reflejos
-    private val LIGHTS_X = floatArrayOf(0f, 150f, 175f, 200f, 225f, 245f, 255f)
-    private val LIGHTS_Y = floatArrayOf(0f, 0f, 30f, 110f, 200f, 250f, 255f)
+    // versión 2: arranca en luma 110 y llega casi al máximo en 200 (la v1 empezaba en 150 y apenas se notaba)
+    private val LIGHTS_X = floatArrayOf(0f, 110f, 140f, 170f, 200f, 225f, 255f)
+    private val LIGHTS_Y = floatArrayOf(0f, 0f, 45f, 130f, 215f, 250f, 255f)
+    const val CURVE_VERSION = 2
 
     private fun curve(xs: FloatArray, ys: FloatArray, luma: Float): Float {
         if (luma <= xs[0]) return ys[0]
@@ -120,7 +122,8 @@ object GainMapAdder {
         xmlns:nivelhdr="$NS"
         hdrgm:Version="1.0"
         nivelhdr:Added="${if (added) "True" else "False"}"
-        nivelhdr:Style="$style">
+        nivelhdr:Style="$style"
+        nivelhdr:Curve="$CURVE_VERSION">
       <Container:Directory>
         <rdf:Seq>
           <rdf:li rdf:parseType="Resource">
@@ -163,7 +166,7 @@ object GainMapAdder {
         return MPF_TAG + b
     }
 
-    class Marks(val added: Boolean, val style: String)
+    class Marks(val added: Boolean, val style: String, val curve: Int)
 
     /**
      * Recorre los segmentos del encabezado (hasta SOS) leyendo solo lo necesario: [read] devuelve los bytes
@@ -196,7 +199,8 @@ object GainMapAdder {
                 val s = String(b, p, minOf(len + 2, b.size - p), Charsets.ISO_8859_1)
                 val added = Regex("nivelhdr:Added=\"(\\w+)\"").find(s)?.groupValues?.get(1) == "True"
                 val style = Regex("nivelhdr:Style=\"(\\w+)\"").find(s)?.groupValues?.get(1) ?: "stock"
-                res = Marks(added, style); false
+                val curve = Regex("nivelhdr:Curve=\"(\\d+)\"").find(s)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+                res = Marks(added, style, curve); false
             } else true
         }
         return res
