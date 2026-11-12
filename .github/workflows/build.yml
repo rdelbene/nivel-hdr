@@ -1,0 +1,48 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Build debug APK
+        shell: bash
+        run: gradle assembleDebug --no-daemon 2>&1 | tee build.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nivel-hdr-apk
+          path: build/outputs/apk/debug/*.apk
+
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" build/outputs/apk/debug/*.apk \
+            --title "Nivel HDR build ${{ github.run_number }}" --notes "APK versión 1.0.${{ github.run_number }} (firma fija: se instala encima de la anterior)"
+
+      - name: Publish build log on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tail -n 200 build.log > build-tail.log || echo "no log" > build-tail.log
+          gh release create "build-${{ github.run_number }}-failed" build-tail.log \
+            --title "FAILED build ${{ github.run_number }}" --notes "Build log"
