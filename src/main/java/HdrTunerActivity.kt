@@ -54,7 +54,15 @@ class HdrTunerActivity : Activity() {
 
     private lateinit var levelLabel: TextView
     private lateinit var autoBtn: TextView
-    private lateinit var addBtn: TextView
+    private lateinit var summary: TextView
+    private lateinit var filterBtn: TextView
+    private lateinit var btnShare: TextView
+    private lateinit var levelBar: SeekBar
+    private var onlyPending = false
+    private val allItems = mutableListOf<Uri>()
+    /** Datos de cada foto para la grilla: nombre y nivel actual (null = sin Ultra HDR). */
+    private class Meta(val name: String, val level: Double?, val pending: Boolean)
+    private val metas = java.util.concurrent.ConcurrentHashMap<Uri, Meta>()
     private lateinit var status: TextView
     private lateinit var grid: GridView
     private lateinit var btnReplace: TextView
@@ -76,6 +84,7 @@ class HdrTunerActivity : Activity() {
             items += shared
             selected += shared
             btnReplace.visibility = View.GONE
+            filterBtn.visibility = View.GONE
             status.text = "${shared.size} foto(s) compartida(s). Las fotos compartidas se guardan como copia."
             adapter.notifyDataSetChanged()
             updateButtons()
@@ -117,35 +126,42 @@ class HdrTunerActivity : Activity() {
             setTextColor(Color.WHITE)
         })
         root.addView(TextView(this).apply {
-            text = "Elegí cuánta luz extra querés que agregue el Ultra HDR. La imagen no se toca: solo cambia la intensidad, " +
-                "y se puede volver a cambiar cuando quieras. A las fotos que no lo traen (x0.5, x3, frontal) se les agrega " +
-                "con la misma curva que usa Motorola en la x1."
+            text = "Elegí cuánta luz extra agrega el Ultra HDR. La imagen no se toca y se puede volver a cambiar. " +
+                "También se puede cambiar desde el panel de notificaciones (botón \"Nivel HDR\")."
             textSize = 13f
             setTextColor(Color.LTGRAY)
-            setPadding(0, dp(4), 0, dp(10))
+            setPadding(0, dp(4), 0, dp(8))
         })
         levelLabel = TextView(this).apply { textSize = 16f; setTextColor(Color.WHITE) }
         root.addView(levelLabel)
         // 100..493 -> ×1.00..×4.93
-        root.addView(SeekBar(this).apply {
+        levelBar = SeekBar(this).apply {
             max = 393
             progress = ((target - 1.0) * 100).roundToInt().coerceIn(0, 393)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { target = 1.0 + p / 100.0; updateLevel() }
                 override fun onStartTrackingTouch(s: SeekBar) {}
                 override fun onStopTrackingTouch(s: SeekBar) {
-                    getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putFloat("tuneBoost", target.toFloat()).apply()
+                    HdrEngine.setBaseLevel(this@HdrTunerActivity, target)
                     if (::autoBtn.isInitialized) updateAuto()
+                    NivelTile.refresh(this@HdrTunerActivity)
                 }
             })
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        root.addView(levelBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         updateLevel()
 
         // automático: el nivel elegido se aplica solo a cada foto nueva de la cámara
         autoBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { toggleAuto() }
         root.addView(autoBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-        addBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { AutoHdr.setAdd(this, !AutoHdr.addOn(this)); updateAuto() }
-        root.addView(addBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(6), 0, 0) }
+        val btnSettings = pillButton("Ajustes", Color.argb(255, 50, 50, 50), Color.WHITE) { showSettings() }
+        val btnRevert = pillButton("Volver todo atrás", Color.argb(255, 50, 50, 50), Color.WHITE) { confirmRevert() }
+        tools.addView(btnSettings, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
+        tools.addView(btnRevert, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6) })
+        root.addView(tools)
+        summary = TextView(this).apply { textSize = 12f; setTextColor(Color.LTGRAY); setPadding(0, dp(6), 0, 0) }
+        root.addView(summary)
         updateAuto()
 
         status = TextView(this).apply {
@@ -155,6 +171,12 @@ class HdrTunerActivity : Activity() {
             text = "Tocá las fotos para elegirlas."
         }
         root.addView(status)
+
+        filterBtn = TextView(this).apply {
+            textSize = 13f; setTextColor(Color.WHITE); setPadding(0, dp(2), 0, dp(6))
+            setOnClickListener { onlyPending = !onlyPending; applyFilter() }
+        }
+        root.addView(filterBtn)
 
         grid = GridView(this).apply {
             numColumns = 3
@@ -171,9 +193,11 @@ class HdrTunerActivity : Activity() {
         root.addView(grid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(10), 0, 0) }
-        btnCopy = pillButton("Guardar copia", Color.argb(255, 50, 50, 50), Color.WHITE) { apply(false) }
+        btnShare = pillButton("Compartir", Color.argb(255, 50, 50, 50), Color.WHITE) { share() }
+        row.addView(btnShare, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
+        btnCopy = pillButton("Copia", Color.argb(255, 50, 50, 50), Color.WHITE) { apply(false) }
         btnReplace = pillButton("Reemplazar", Color.rgb(0, 224, 150), Color.BLACK) { apply(true) }
-        row.addView(btnCopy, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
+        row.addView(btnCopy, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6); rightMargin = dp(6) })
         row.addView(btnReplace, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6) })
         root.addView(row)
         setContentView(root)
@@ -205,6 +229,11 @@ class HdrTunerActivity : Activity() {
         if (wantAuto && AutoHdr.canWrite()) { wantAuto = false; toggleAuto() }
         if (::autoBtn.isInitialized) updateAuto()
         AutoHdr.ensure(this)
+        // el nivel pudo cambiar desde el panel de notificaciones
+        val b = HdrEngine.baseLevel(this)
+        if (::levelBar.isInitialized && kotlin.math.abs(b - target) > 0.005) {
+            target = b; levelBar.progress = ((target - 1.0) * 100).roundToInt().coerceIn(0, 393); updateLevel()
+        }
     }
 
     private fun updateAuto() {
@@ -214,10 +243,14 @@ class HdrTunerActivity : Activity() {
             else "Automático: apagado · tocá para aplicar este nivel a cada foto nueva"
         (autoBtn.background as GradientDrawable).setColor(if (on) Color.rgb(0, 224, 150) else Color.argb(255, 50, 50, 50))
         autoBtn.setTextColor(if (on) Color.BLACK else Color.WHITE)
-        if (::addBtn.isInitialized) {
-            val add = AutoHdr.addOn(this)
-            addBtn.text = if (add) "Agregar Ultra HDR a x0.5, x3 y frontal: SÍ" else "Agregar Ultra HDR a x0.5, x3 y frontal: NO"
-            (addBtn.background as GradientDrawable).setColor(if (add && on) Color.rgb(0, 160, 110) else Color.argb(255, 50, 50, 50))
+        if (::summary.isInitialized) {
+            summary.text = buildString {
+                append("Estilo: " + (if (HdrEngine.style(this@HdrTunerActivity) == "luces") "solo las luces" else "como la stock"))
+                append(" · x0.5/x3/frontal: " + (if (AutoHdr.addOn(this@HdrTunerActivity)) "se les agrega" else "no"))
+                if (HdrEngine.perLens(this@HdrTunerActivity)) append(" · por lente: " + HdrEngine.Lens.values().joinToString(" ") {
+                    it.label + " " + HdrEngine.lensPct(this@HdrTunerActivity, it) + "%" })
+                if (HdrEngine.sceneOn(this@HdrTunerActivity)) append(" · según escena")
+            }
         }
     }
 
@@ -236,7 +269,8 @@ class HdrTunerActivity : Activity() {
         btnCopy.alpha = if (n > 0) 1f else 0.4f
         btnReplace.alpha = if (n > 0) 1f else 0.4f
         btnReplace.text = if (n > 0) "Reemplazar ($n)" else "Reemplazar"
-        btnCopy.text = if (n > 0) "Guardar copia ($n)" else "Guardar copia"
+        btnCopy.text = if (n > 0) "Copia ($n)" else "Copia"
+        btnShare.alpha = if (n > 0) 1f else 0.4f
     }
 
     private inner class ThumbAdapter : BaseAdapter() {
@@ -253,11 +287,30 @@ class HdrTunerActivity : Activity() {
                     setTextColor(Color.BLACK); typeface = Typeface.DEFAULT_BOLD
                     background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.rgb(0, 224, 150)) }
                 }, FrameLayout.LayoutParams(dp(28), dp(28), Gravity.TOP or Gravity.END).apply { setMargins(dp(6), dp(6), dp(6), dp(6)) })
+                addView(TextView(context).apply {
+                    tag = "lvl"; textSize = 11f; typeface = Typeface.DEFAULT_BOLD
+                    setPadding(dp(6), dp(2), dp(6), dp(2))
+                }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply { setMargins(dp(4), dp(4), dp(4), dp(4)) })
             }
             cell.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, if (size > 0) size else dp(110))
             val uri = items[position]
             val img = cell.findViewWithTag<ImageView>("img")
             val chk = cell.findViewWithTag<TextView>("chk")
+            val lvl = cell.findViewWithTag<TextView>("lvl")
+            val meta = metas[uri]
+            if (meta == null) lvl.visibility = View.GONE else {
+                lvl.visibility = View.VISIBLE
+                lvl.text = when {
+                    meta.level == null -> "sin HDR"
+                    meta.pending -> "×%.1f · sin ajustar".format(meta.level)
+                    else -> "×%.1f".format(meta.level)
+                }
+                lvl.setTextColor(if (meta.pending) Color.BLACK else Color.WHITE)
+                lvl.background = GradientDrawable().apply {
+                    cornerRadius = dp(8).toFloat()
+                    setColor(if (meta.pending) Color.rgb(255, 170, 0) else Color.argb(170, 0, 0, 0))
+                }
+            }
             val sel = uri in selected
             chk.visibility = if (sel) View.VISIBLE else View.GONE
             img.alpha = if (sel) 0.7f else 1f
@@ -299,26 +352,35 @@ class HdrTunerActivity : Activity() {
     private fun loadRecent() {
         io.execute {
             val list = mutableListOf<Uri>()
+            val names = HashMap<Uri, String>()
             try {
                 contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    arrayOf(MediaStore.MediaColumns._ID),
+                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
                     "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.MIME_TYPE} = ?",
                     arrayOf("DCIM/Camera%", "image/jpeg"),
                     "${MediaStore.MediaColumns.DATE_ADDED} DESC"
                 )?.use { c ->
                     while (c.moveToNext() && list.size < 150) {
-                        list += ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
+                        val u = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
+                        list += u; names[u] = c.getString(1) ?: ""
                     }
                 }
             } catch (e: Exception) {
                 main.post { status.text = "No pude leer la galería: ${e.message}" }
             }
             main.post {
-                items.clear(); items += list
-                adapter.notifyDataSetChanged()
+                allItems.clear(); allItems += list
+                applyFilter()
                 status.text = if (list.isEmpty()) "No encontré fotos en DCIM/Camera." else "Tocá las fotos para elegirlas (${list.size} recientes)."
             }
+            // nivel de cada foto (lectura parcial del archivo: encabezado + comienzo del gain map)
+            for (u in list) {
+                val lv = try { readLevel(u) } catch (_: Exception) { null }
+                val name = names[u] ?: ""
+                metas[u] = Meta(name, lv, !name.contains("_HDRx"))
+            }
+            main.post { applyFilter() }
         }
     }
 
@@ -364,20 +426,18 @@ class HdrTunerActivity : Activity() {
         status.text = "Procesando ${list.size} foto(s)..."
         io.execute {
             var ok = 0; var noHdr = 0; var fail = 0; var added = 0
+            var lastBoost = t
             var before = 0.0
             for (u in list) {
                 try {
                     val src = contentResolver.openInputStream(u)?.use { it.readBytes() } ?: throw IllegalStateException("sin datos")
                     val info = UltraHdrTuner.analyze(src)
-                    val out: ByteArray
-                    if (info == null) {
-                        // sin Ultra HDR (x3, x0.5, frontal): se le agrega con la curva de la stock
-                        out = AutoHdr.addGainMapBytes(src, t) ?: run { noHdr++; null } ?: continue
-                        added++
-                    } else {
-                        before = info.maxBoost
-                        out = UltraHdrTuner.setMaxBoost(src, t) ?: run { noHdr++; null } ?: continue
-                    }
+                    if (info != null) before = info.maxBoost
+                    // mismo motor que el automático: lente, escena, estilo; a las que no tienen se les agrega
+                    val r = HdrEngine.render(this, src, true, baseOverride = t) ?: run { noHdr++; null } ?: continue
+                    if (r.kind == "agregada") added++
+                    lastBoost = r.boost
+                    val out = r.bytes
                     if (replace) {
                         contentResolver.openOutputStream(u, "wt")?.use { it.write(out) } ?: throw IllegalStateException("no se pudo escribir")
                         // el nivel también queda en el nombre de la foto
@@ -385,12 +445,12 @@ class HdrTunerActivity : Activity() {
                             val name = contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
                                 ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
                             if (name != null) {
-                                val nn = AutoHdr.nameWithLevel(name, t)
+                                val nn = AutoHdr.nameWithLevel(name, lastBoost)
                                 if (nn != name) contentResolver.update(u, ContentValues().apply { put(MediaStore.MediaColumns.DISPLAY_NAME, nn) }, null, null)
                             }
                         } catch (_: Exception) {}
                     } else {
-                        saveCopy(u, out, t)
+                        saveCopy(u, out, lastBoost)
                     }
                     ok++
                 } catch (e: Exception) {
@@ -400,14 +460,14 @@ class HdrTunerActivity : Activity() {
             main.post {
                 status.text = buildString {
                     append(if (replace) "Reemplazadas: $ok" else "Copias guardadas: $ok")
-                    if (ok > 0 && before > 0) append(" (antes ×%.2f, ahora ×%.2f)".format(before, t))
+                    if (ok > 0 && before > 0) append(" (antes ×%.2f, ahora ×%.2f)".format(before, lastBoost))
                     if (added > 0) append(" · con Ultra HDR agregado: $added")
                     if (noHdr > 0) append(" · no se pudieron tocar: $noHdr")
                     if (fail > 0) append(" · con error: $fail")
                     if (replace && ok > 0) append("\nSi la galería muestra la versión vieja, cerrala y volvé a abrirla.")
                 }
                 if (!sharedMode) { selected.clear(); adapter.notifyDataSetChanged(); updateButtons() }
-                if (!replace && ok > 0 && !sharedMode) loadRecent()
+                if (ok > 0 && !sharedMode) loadRecent()
             }
         }
     }
@@ -431,6 +491,159 @@ class HdrTunerActivity : Activity() {
         }
         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: throw IllegalStateException("no se pudo crear la copia")
         contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+    }
+
+    // ------------------------------------------------------------------ grilla: nivel y filtro
+
+    private fun applyFilter() {
+        items.clear()
+        items += if (onlyPending) allItems.filter { metas[it]?.pending != false } else allItems
+        val pend = allItems.count { metas[it]?.pending == true }
+        filterBtn.text = if (onlyPending) "Mostrando: sin ajustar ($pend) · tocá para ver todas" else "Mostrando: todas · tocá para ver solo las sin ajustar ($pend)"
+        adapter.notifyDataSetChanged()
+    }
+
+    /** Nivel actual leyendo solo el encabezado y el comienzo del gain map (rápido aunque la foto pese mucho). */
+    private fun readLevel(u: Uri): Double? {
+        contentResolver.openFileDescriptor(u, "r")?.use { pfd ->
+            java.io.FileInputStream(pfd.fileDescriptor).channel.use { ch ->
+                val head = java.nio.ByteBuffer.allocate(minOf(ch.size(), 262144L).toInt())
+                ch.read(head, 0)
+                val hb = head.array()
+                val off = GainMapAdder.primaryLength(hb) ?: return null
+                val gm = java.nio.ByteBuffer.allocate(minOf(8192L, ch.size() - off).toInt().coerceAtLeast(0))
+                ch.read(gm, off.toLong())
+                return UltraHdrTuner.analyze(gm.array())?.maxBoost
+            }
+        }
+        return null
+    }
+
+    // ------------------------------------------------------------------ ajustes
+
+    private fun showSettings() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
+        fun sw(text: String, on: Boolean, f: (Boolean) -> Unit) = android.widget.Switch(this).apply {
+            this.text = text; isChecked = on; textSize = 15f; setPadding(0, dp(8), 0, dp(8))
+            setOnCheckedChangeListener { _, v -> f(v); updateAuto() }
+        }
+        fun note(t: String) = TextView(this).apply { text = t; textSize = 12f; setTextColor(Color.GRAY); setPadding(0, 0, 0, dp(6)) }
+
+        box.addView(sw("Agregar Ultra HDR a x0.5, x3 y frontal", AutoHdr.addOn(this)) { AutoHdr.setAdd(this, it) })
+        box.addView(note("Con la misma curva que usa Motorola en la x1. La foto no se recomprime."))
+
+        box.addView(sw("Estilo: solo las luces", HdrEngine.style(this) == "luces") { HdrEngine.setStyle(this, if (it) "luces" else "stock") })
+        box.addView(note("Apagado: como la stock (ilumina casi toda la foto). Prendido: la foto queda normal y brillan solo cielo, lámparas y reflejos."))
+
+        box.addView(sw("Nivel según la escena", HdrEngine.sceneOn(this)) { HdrEngine.setScene(this, it) })
+        box.addView(note("Noche: menos (×0.6 en pasos) · contraluz o muy clara: ×0.8 · escena apagada: ×1.2. El nombre muestra el nivel final."))
+
+        val lensBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        for (l in HdrEngine.Lens.values()) {
+            val lab = TextView(this).apply { textSize = 13f }
+            fun upd(v: Int) { lab.text = "${l.label}: $v % del nivel" }
+            upd(HdrEngine.lensPct(this, l))
+            lensBox.addView(lab)
+            lensBox.addView(SeekBar(this).apply {
+                max = 150; progress = HdrEngine.lensPct(this@HdrTunerActivity, l)
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { upd(p) }
+                    override fun onStartTrackingTouch(s: SeekBar) {}
+                    override fun onStopTrackingTouch(s: SeekBar) { HdrEngine.setLensPct(this@HdrTunerActivity, l, s.progress); updateAuto() }
+                })
+            })
+        }
+        lensBox.visibility = if (HdrEngine.perLens(this)) View.VISIBLE else View.GONE
+        box.addView(sw("Nivel distinto por lente", HdrEngine.perLens(this)) { HdrEngine.setPerLens(this, it); lensBox.visibility = if (it) View.VISIBLE else View.GONE })
+        box.addView(note("Porcentaje del nivel elegido arriba (en pasos de luz). 100 % = igual; la frontal arranca en 60 %."))
+        box.addView(lensBox)
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Ajustes")
+            .setView(android.widget.ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Listo", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------ volver todo atrás
+
+    private fun confirmRevert() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle("¿Volver todo atrás?")
+            .setMessage("Las fotos de la cámara que ajustó Nivel HDR (las que tienen _HDRx en el nombre) quedan como las guardó la cámara: " +
+                "las de la x1 vuelven a ×4.93 y a las de x0.5, x3 y frontal se les saca el Ultra HDR. También se saca el nivel del nombre. " +
+                "Las copias guardadas no se tocan. El automático sigue como está.")
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Volver atrás") { _, _ -> doRevert() }
+            .show()
+    }
+
+    private fun doRevert() {
+        if (!AutoHdr.canWrite()) {
+            status.text = "Para esto hace falta \"Acceso a todos los archivos\". Activalo y volvé a tocar \"Volver todo atrás\"."
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName")))
+            } catch (_: Exception) {}
+            return
+        }
+        status.text = "Volviendo atrás..."
+        io.execute {
+            val n = AutoHdr.revertAll(this) { k, total -> main.post { status.text = "Volviendo atrás... $k de $total" } }
+            main.post { status.text = "Listo: $n foto(s) quedaron como las guardó la cámara."; loadRecent() }
+        }
+    }
+
+    // ------------------------------------------------------------------ compartir
+
+    private fun share() {
+        val list = selected.toList()
+        if (list.isEmpty()) { status.text = "Primero elegí una o más fotos."; return }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Compartir ${list.size} foto(s)")
+            .setItems(arrayOf(
+                "Con Ultra HDR (en WhatsApp elegí enviar como Documento)",
+                "Sin Ultra HDR (se ve igual en cualquier celular)"
+            )) { _, which -> if (which == 0) sendUris(list) else shareSdr(list) }
+            .show()
+    }
+
+    private fun sendUris(list: List<Uri>) {
+        val i = if (list.size == 1) Intent(Intent.ACTION_SEND).putExtra(Intent.EXTRA_STREAM, list[0])
+            else Intent(Intent.ACTION_SEND_MULTIPLE).putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(list))
+        i.type = "image/jpeg"
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(Intent.createChooser(i, "Compartir"))
+    }
+
+    /** Copias sin Ultra HDR en Pictures/Nivel HDR (se borran las de la vez anterior) y se comparten esas. */
+    private fun shareSdr(list: List<Uri>) {
+        status.text = "Preparando copias sin Ultra HDR..."
+        io.execute {
+            try {
+                contentResolver.delete(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                    "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?", arrayOf("Pictures/Nivel HDR%"))
+            } catch (_: Exception) {}
+            val out = ArrayList<Uri>()
+            for (u in list) {
+                try {
+                    val src = contentResolver.openInputStream(u)?.use { it.readBytes() } ?: continue
+                    val name = contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
+                        ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: "foto.jpg"
+                    val v = ContentValues().apply {
+                        put(MediaStore.MediaColumns.DISPLAY_NAME, name.substringBeforeLast('.') + "_SDR.jpg")
+                        put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/Nivel HDR")
+                    }
+                    val nu = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v) ?: continue
+                    contentResolver.openOutputStream(nu)?.use { it.write(HdrEngine.sdrCopy(src)) }
+                    out += nu
+                } catch (_: Exception) {}
+            }
+            main.post {
+                status.text = "Listo para compartir: ${out.size} foto(s) sin Ultra HDR."
+                if (out.isNotEmpty()) sendUris(out)
+            }
+        }
     }
 
     companion object {

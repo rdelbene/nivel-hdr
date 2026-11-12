@@ -30,7 +30,7 @@ object AutoHdr {
     fun setAdd(ctx: Context, on: Boolean) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("autoAdd", on).apply()
 
     fun isOn(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("autoOn", false)
-    fun level(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getFloat("tuneBoost", 2.5f).toDouble()
+    fun level(ctx: Context) = HdrEngine.baseLevel(ctx)
     fun canWrite() = Environment.isExternalStorageManager()
 
     /** Prende o apaga. Al prender, solo cuentan las fotos que se saquen desde ahora. */
@@ -66,7 +66,6 @@ object AutoHdr {
         if (!isOn(ctx) || !canWrite()) return 0
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         var lastId = prefs.getLong("autoLastId", Long.MAX_VALUE)
-        val target = level(ctx)
         var changed = 0
         val cols = arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATA, MediaStore.Images.Media.IS_PENDING,
             MediaStore.Images.Media.OWNER_PACKAGE_NAME, MediaStore.Images.Media.MIME_TYPE, MediaStore.Images.Media.RELATIVE_PATH)
@@ -85,12 +84,13 @@ object AutoHdr {
                     try {
                         val f = File(path)
                         waitStable(f)
-                        var adjusted = adjustFile(f, target)
-                        // sin Ultra HDR (x3, x0.5, frontal): se le agrega con la curva de la stock
-                        if (!adjusted && addOn(ctx) && rel.startsWith("DCIM/Camera")) adjusted = addToFile(f, target)
-                        if (adjusted) changed++
-                        // el nivel queda en el nombre (solo si la foto es Ultra HDR)
-                        val newPath = if (adjusted || UltraHdrTuner.analyze(f.readBytes()) != null) renameWithLevel(ctx, id, f, target) else null
+                        val src = f.readBytes()
+                        val r = HdrEngine.render(ctx, src, addOn(ctx) && rel.startsWith("DCIM/Camera"))
+                        var newPath: String? = null
+                        if (r != null) {
+                            if (r.kind != "igual") { writeBytes(f, src, r.bytes); changed++ }
+                            newPath = renameWithLevel(ctx, id, f, r.boost) // el nivel queda en el nombre
+                        }
                         paths += newPath ?: path
                     } catch (_: Exception) {}
                 }
@@ -142,55 +142,60 @@ object AutoHdr {
         }
     }
 
-    /**
-     * Arma el archivo con Ultra HDR para una foto que no lo tiene (la imagen principal no se recomprime).
-     * Null si ya tiene, si es foto en movimiento o si no se pudo.
-     */
-    fun addGainMapBytes(src: ByteArray, target: Double): ByteArray? {
-        if (UltraHdrTuner.analyze(src) != null) return null
-        val opt = android.graphics.BitmapFactory.Options().apply { inSampleSize = 4 } // gain map a 1/4, como la stock
-        val small = android.graphics.BitmapFactory.decodeByteArray(src, 0, src.size, opt) ?: return null
-        val w = small.width; val h = small.height
-        val px = IntArray(w * h)
-        small.getPixels(px, 0, w, 0, 0, w, h)
-        small.recycle()
-        val gm = GainMapAdder.gainMapFromSmall(px, w, h)
-        for (i in px.indices) { val v = gm[i].toInt() and 255; px[i] = (0xff shl 24) or (v shl 16) or (v shl 8) or v }
-        val gbmp = android.graphics.Bitmap.createBitmap(px, w, h, android.graphics.Bitmap.Config.ARGB_8888)
-        val bos = java.io.ByteArrayOutputStream()
-        gbmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, bos)
-        gbmp.recycle()
-        val stops = Math.log(target.coerceAtLeast(1.0)) / Math.log(2.0)
-        return GainMapAdder.build(src, bos.toByteArray(), stops)
-    }
-
-    /** Agrega Ultra HDR al archivo (cambia de tamaño: se reescribe entero). */
-    fun addToFile(f: File, target: Double): Boolean {
-        val src = f.readBytes()
-        val out = addGainMapBytes(src, target) ?: return false
-        java.io.FileOutputStream(f).use { it.write(out); it.fd.sync() }
-        return true
-    }
-
-    /** Reescribe en el lugar solo los bytes que cambian. */
-    fun adjustFile(f: File, target: Double): Boolean {
-        val src = f.readBytes()
-        val info = UltraHdrTuner.analyze(src) ?: return false
-        if (kotlin.math.abs(info.maxBoost - target) < 0.02) return false
-        val out = UltraHdrTuner.setMaxBoost(src, target) ?: return false
-        if (out.size != src.size) return false
-        RandomAccessFile(f, "rw").use { raf ->
-            var i = 0
-            while (i < src.size) {
-                if (src[i] != out[i]) {
-                    var j = i
-                    while (j < src.size && src[j] != out[j]) j++
-                    raf.seek(i.toLong()); raf.write(out, i, j - i)
-                    i = j
-                } else i++
+    /** Escribe el resultado: si quedó del mismo tamaño, solo los bytes que cambian; si no, el archivo entero. */
+    fun writeBytes(f: File, src: ByteArray, out: ByteArray) {
+        if (out.size == src.size) {
+            RandomAccessFile(f, "rw").use { raf ->
+                var i = 0
+                while (i < src.size) {
+                    if (src[i] != out[i]) {
+                        var j = i
+                        while (j < src.size && src[j] != out[j]) j++
+                        raf.seek(i.toLong()); raf.write(out, i, j - i)
+                        i = j
+                    } else i++
+                }
             }
+        } else {
+            java.io.FileOutputStream(f).use { it.write(out); it.fd.sync() }
         }
-        return true
+    }
+
+    /** Volver todo atrás: deja como las guardó la cámara las fotos que tocó esta app. Devuelve cuántas. */
+    fun revertAll(ctx: Context, progress: (Int, Int) -> Unit): Int {
+        val list = mutableListOf<Pair<Long, String>>()
+        ctx.contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATA, MediaStore.Images.Media.OWNER_PACKAGE_NAME),
+            "${MediaStore.Images.Media.DISPLAY_NAME} LIKE ? AND ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
+            arrayOf("%_HDRx%", "DCIM/%"), null)?.use { c ->
+            // las copias que guardó esta app quedan como están (son copias, no originales)
+            while (c.moveToNext()) if (c.getString(2) != ctx.packageName) c.getString(1)?.let { list += c.getLong(0) to it }
+        }
+        var done = 0
+        val paths = mutableListOf<String>()
+        for ((k, e) in list.withIndex()) {
+            progress(k + 1, list.size)
+            try {
+                val f = File(e.second)
+                val src = f.readBytes()
+                HdrEngine.revert(src)?.let { writeBytes(f, src, it) }
+                // sacar el sufijo del nombre
+                val clean = SUFFIX.replace(f.nameWithoutExtension, "") + "." + f.extension
+                var p = f.path
+                if (clean != f.name) {
+                    val uri = android.content.ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, e.first)
+                    val ok = try {
+                        ctx.contentResolver.update(uri, android.content.ContentValues().apply { put(MediaStore.Images.Media.DISPLAY_NAME, clean) }, null, null) > 0
+                    } catch (_: Exception) { false }
+                    if (ok) p = File(f.parentFile, clean).path
+                    else { val dst = File(f.parentFile, clean); if (!dst.exists() && f.renameTo(dst)) { paths += f.path; p = dst.path } }
+                }
+                paths += p
+                done++
+            } catch (_: Exception) {}
+        }
+        if (paths.isNotEmpty()) MediaScannerConnection.scanFile(ctx, paths.toTypedArray(), null, null)
+        return done
     }
 }
 
