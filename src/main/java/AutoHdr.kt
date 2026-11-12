@@ -78,7 +78,14 @@ object AutoHdr {
                 val rel = c.getString(5) ?: ""
                 val ours = owner == ctx.packageName // las copias que guarda esta app ya tienen su nivel
                 if (!ours && mime == "image/jpeg" && rel.startsWith("DCIM/") && path != null) {
-                    try { if (adjustFile(File(path), target)) { changed++; paths += path } } catch (_: Exception) {}
+                    try {
+                        val f = File(path)
+                        val adjusted = adjustFile(f, target)
+                        if (adjusted) changed++
+                        // el nivel queda en el nombre (solo si la foto es Ultra HDR)
+                        val newPath = if (adjusted || UltraHdrTuner.analyze(f.readBytes()) != null) renameWithLevel(ctx, id, f, target) else null
+                        paths += newPath ?: path
+                    } catch (_: Exception) {}
                 }
                 lastId = id
             }
@@ -87,6 +94,34 @@ object AutoHdr {
         if (paths.isNotEmpty()) MediaScannerConnection.scanFile(ctx, paths.toTypedArray(), null, null)
         if (changed > 0) prefs.edit().putInt("autoCount", prefs.getInt("autoCount", 0) + changed).apply()
         return changed
+    }
+
+    private val SUFFIX = Regex("_HDRx\\d+(\\.\\d+)?$")
+
+    /** Nombre con el nivel al final: IMG_20261112_0941.jpg -> IMG_20261112_0941_HDRx2.5.jpg (reemplaza uno viejo). */
+    fun nameWithLevel(name: String, boost: Double): String {
+        val dot = name.lastIndexOf('.')
+        val base = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ".jpg"
+        return SUFFIX.replace(base, "") + "_HDRx" + String.format(java.util.Locale.US, "%.1f", boost) + ext
+    }
+
+    /**
+     * Renombra la foto para que lleve el nivel. Primero por MediaStore (mantiene la misma foto en la galería);
+     * si no deja, renombra el archivo y avisa a la galería. Devuelve la ruta nueva o null si no cambió.
+     */
+    fun renameWithLevel(ctx: Context, id: Long, f: File, boost: Double): String? {
+        val newName = nameWithLevel(f.name, boost)
+        if (newName == f.name) return null
+        val uri = android.content.ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        try {
+            val cv = android.content.ContentValues().apply { put(MediaStore.Images.Media.DISPLAY_NAME, newName) }
+            if (ctx.contentResolver.update(uri, cv, null, null) > 0) return File(f.parentFile, newName).path
+        } catch (_: Exception) {}
+        val dst = File(f.parentFile, newName)
+        if (dst.exists() || !f.renameTo(dst)) return null
+        MediaScannerConnection.scanFile(ctx, arrayOf(f.path, dst.path), null, null)
+        return null // el escaneo de arriba ya avisa de las dos rutas
     }
 
     /** Reescribe en el lugar solo los bytes que cambian. */

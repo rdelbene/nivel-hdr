@@ -365,6 +365,15 @@ class HdrTunerActivity : Activity() {
                     val out = UltraHdrTuner.setMaxBoost(src, t) ?: run { noHdr++; null } ?: continue
                     if (replace) {
                         contentResolver.openOutputStream(u, "wt")?.use { it.write(out) } ?: throw IllegalStateException("no se pudo escribir")
+                        // el nivel también queda en el nombre de la foto
+                        try {
+                            val name = contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
+                                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                            if (name != null) {
+                                val nn = AutoHdr.nameWithLevel(name, t)
+                                if (nn != name) contentResolver.update(u, ContentValues().apply { put(MediaStore.MediaColumns.DISPLAY_NAME, nn) }, null, null)
+                            }
+                        } catch (_: Exception) {}
                     } else {
                         saveCopy(u, out, t)
                     }
@@ -399,7 +408,7 @@ class HdrTunerActivity : Activity() {
             }
         } catch (_: Exception) {}
         val v = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, "${name}_HDRx%.1f.jpg".format(t))
+            put(MediaStore.MediaColumns.DISPLAY_NAME, AutoHdr.nameWithLevel("$name.jpg", t))
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
             put(MediaStore.MediaColumns.RELATIVE_PATH, "DCIM/Camera")
             put(MediaStore.Images.Media.DATE_TAKEN, taken)
