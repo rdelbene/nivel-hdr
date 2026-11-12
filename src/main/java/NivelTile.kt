@@ -40,6 +40,7 @@ class NivelTile : TileService() {
         val idx = PRESETS.indexOfFirst { it.first > cur + 0.05 }
         val next = if (idx < 0) PRESETS[0].first else PRESETS[idx].first
         HdrEngine.setBaseLevel(this, next)
+        AutoHdrService.refresh(this)
         update()
     }
 

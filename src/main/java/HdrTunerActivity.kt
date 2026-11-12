@@ -144,6 +144,7 @@ class HdrTunerActivity : Activity() {
                     HdrEngine.setBaseLevel(this@HdrTunerActivity, target)
                     if (::autoBtn.isInitialized) updateAuto()
                     NivelTile.refresh(this@HdrTunerActivity)
+                    AutoHdrService.refresh(this@HdrTunerActivity)
                 }
             })
         }
@@ -202,6 +203,8 @@ class HdrTunerActivity : Activity() {
     }
 
     private fun toggleAuto() {
+        if (AutoHdr.isOn(this) && AutoHdr.canWrite() &&
+            !getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) { askBattery(); return }
         if (AutoHdr.isOn(this)) { AutoHdr.setOn(this, false); updateAuto(); return }
         if (!AutoHdr.canWrite()) {
             status.text = "Activá \"Permitir acceso para administrar todos los archivos\" para Nivel HDR y volvé."
@@ -214,7 +217,11 @@ class HdrTunerActivity : Activity() {
             return
         }
         getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putFloat("tuneBoost", target.toFloat()).apply()
+        // notificación fija del servicio y "sin restricciones" de batería, para que Android no lo cierre
+        if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7)
         AutoHdr.setOn(this, true)
+        askBattery()
         updateAuto()
         status.text = "Listo: cada foto nueva de la cámara se ajusta sola a ×%.2f.".format(target)
     }
@@ -233,10 +240,21 @@ class HdrTunerActivity : Activity() {
         }
     }
 
+    /** Pide que Android no le aplique ahorro de batería (si no, puede demorar o cortar el automático). */
+    private fun askBattery() {
+        val pm = getSystemService(android.os.PowerManager::class.java)
+        if (pm.isIgnoringBatteryOptimizations(packageName)) return
+        try {
+            startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        } catch (_: Exception) {}
+    }
+
     private fun updateAuto() {
         val on = AutoHdr.isOn(this) && AutoHdr.canWrite()
         val n = getSharedPreferences("cfg", Context.MODE_PRIVATE).getInt("autoCount", 0)
-        autoBtn.text = if (on) "Automático: PRENDIDO · fotos nuevas a ×%.2f (%d ajustadas)".format(AutoHdr.level(this), n)
+        val batOk = getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        autoBtn.text = if (on && !batOk) "Automático: PRENDIDO pero con ahorro de batería · tocá para corregir"
+            else if (on) "Automático: PRENDIDO · fotos nuevas a ×%.2f (%d ajustadas)".format(AutoHdr.level(this), n)
             else "Automático: apagado · tocá para aplicar este nivel a cada foto nueva"
         (autoBtn.background as GradientDrawable).setColor(if (on) Color.rgb(0, 224, 150) else Color.argb(255, 50, 50, 50))
         autoBtn.setTextColor(if (on) Color.BLACK else Color.WHITE)

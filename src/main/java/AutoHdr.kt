@@ -23,6 +23,7 @@ import java.io.RandomAccessFile
  */
 object AutoHdr {
     private const val JOB_ID = 4931
+    private const val JOB_PERIODIC = 4932
     private const val PREFS = "cfg"
 
     /** Agregar Ultra HDR a las fotos que llegan sin él (x3, x0.5, frontal). Prendido por defecto. */
@@ -38,11 +39,16 @@ object AutoHdr {
         val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("autoOn", on)
         if (on) p.putLong("autoLastId", maxId(ctx))
         p.apply()
-        if (on) schedule(ctx) else ctx.getSystemService(JobScheduler::class.java).cancel(JOB_ID)
+        if (on) { schedule(ctx); AutoHdrService.start(ctx) }
+        else {
+            val js = ctx.getSystemService(JobScheduler::class.java)
+            js.cancel(JOB_ID); js.cancel(JOB_PERIODIC)
+            AutoHdrService.stop(ctx)
+        }
     }
 
-    /** Se llama al abrir la app: si estaba prendido, se asegura de que el aviso siga programado. */
-    fun ensure(ctx: Context) { if (isOn(ctx)) schedule(ctx) }
+    /** Se llama al abrir la app, al reiniciar y en cada revisión: si está prendido, levanta todo de nuevo. */
+    fun ensure(ctx: Context) { if (isOn(ctx)) { schedule(ctx); AutoHdrService.start(ctx) } }
 
     fun schedule(ctx: Context) {
         val js = ctx.getSystemService(JobScheduler::class.java)
@@ -53,6 +59,13 @@ object AutoHdr {
             .setTriggerContentMaxDelay(3000)
             .build()
         js.schedule(job)
+        // respaldo: cada 15 minutos revisa si quedó alguna foto sin ajustar (y vuelve a levantar el servicio)
+        if (js.getPendingJob(JOB_PERIODIC) == null) {
+            js.schedule(JobInfo.Builder(JOB_PERIODIC, ComponentName(ctx, AutoHdrJob::class.java))
+                .setPeriodic(15 * 60 * 1000L)
+                .setPersisted(true)
+                .build())
+        }
     }
 
     private fun maxId(ctx: Context): Long {
@@ -62,6 +75,7 @@ object AutoHdr {
     }
 
     /** Ajusta las fotos nuevas de DCIM/Camera. Devuelve cuántas cambió. */
+    @Synchronized
     fun processNew(ctx: Context): Int {
         if (!isOn(ctx) || !canWrite()) return 0
         val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -202,7 +216,8 @@ object AutoHdr {
 class AutoHdrJob : JobService() {
     override fun onStartJob(params: JobParameters): Boolean {
         Thread {
-            try { AutoHdr.processNew(applicationContext) } catch (_: Throwable) {}
+            try { if (AutoHdr.processNew(applicationContext) > 0) AutoHdrService.refresh(applicationContext) } catch (_: Throwable) {}
+            if (params.jobId == 4932) AutoHdr.ensure(applicationContext) // la revisión periódica levanta el servicio si se cayó
             // el disparador de contenido sirve una sola vez: se vuelve a programar
             if (AutoHdr.isOn(applicationContext)) AutoHdr.schedule(applicationContext)
             jobFinished(params, false)
