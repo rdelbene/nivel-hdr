@@ -218,19 +218,26 @@ class HdrTunerActivity : Activity() {
         }
         getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putFloat("tuneBoost", target.toFloat()).apply()
         // notificación fija del servicio y "sin restricciones" de batería, para que Android no lo cierre
+        AutoHdr.setOn(this, true)
+        // primero notificaciones y, cuando se contesta, batería (las dos ventanas juntas se pisan)
         if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED)
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7)
-        AutoHdr.setOn(this, true)
-        askBattery()
+        else askBattery()
         updateAuto()
         status.text = "Listo: cada foto nueva de la cámara se ajusta sola a ×%.2f.".format(target)
     }
 
     private var wantAuto = false
+    private var askedBattery = false
 
     override fun onResume() {
         super.onResume()
         if (wantAuto && AutoHdr.canWrite()) { wantAuto = false; toggleAuto() }
+        // automático ya prendido (de una versión anterior) sin "sin restricciones": se pide una vez por apertura
+        if (!askedBattery && AutoHdr.isOn(this) && AutoHdr.canWrite() &&
+            !getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)) {
+            askedBattery = true; askBattery()
+        }
         if (::autoBtn.isInitialized) updateAuto()
         AutoHdr.ensure(this)
         // el nivel pudo cambiar desde el panel de notificaciones
@@ -359,6 +366,8 @@ class HdrTunerActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
+        // notificaciones del automático contestado: ahora sí, batería
+        if (code == 7) { AutoHdrService.refresh(this); askBattery(); return }
         if (hasReadPermission()) loadRecent() else status.text = "Sin permiso para ver las fotos."
     }
 
