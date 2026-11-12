@@ -212,7 +212,7 @@ object GainMapAdder {
         walk(size, read) { m, pos, len ->
             if (m == 0xe2 && len in 12..4096) {
                 val seg = read(pos, len + 2)
-                if (startsWith(seg, 4, MPF_TAG)) { res = primaryLength(seg, 0); false } else true
+                if (startsWith(seg, 4, MPF_TAG)) { res = mpfGainStart(seg, 0)?.let { (it + pos).toInt() }; false } else true
             } else true
         }
         return res
@@ -222,13 +222,38 @@ object GainMapAdder {
     fun primaryLength(b: ByteArray): Int? {
         var res: Int? = null
         walk(b.size.toLong(), arrReader(b)) { m, pos, len ->
-            if (m == 0xe2 && startsWith(b, pos.toInt() + 4, MPF_TAG)) { res = primaryLength(b, pos.toInt()); false } else true
+            if (m == 0xe2 && startsWith(b, pos.toInt() + 4, MPF_TAG)) { res = mpfGainStart(b, pos.toInt())?.let { (it + pos).toInt() }; false } else true
         }
-        return res?.takeIf { it in 4..b.size }
+        // se confirma que ahí empieza otra JPEG; si no, se usa el fin real de la principal
+        val r = res
+        if (r != null && r + 1 < b.size && (b[r].toInt() and 255) == 0xff && (b[r + 1].toInt() and 255) == 0xd8) return r
+        return if (r != null) primaryEnd(b) else null
     }
 
-    /** Lee el tamaño de la primera imagen del segmento MPF que empieza en [segPos] (FF E2 LL LL "MPF\0" TIFF...). */
-    private fun primaryLength(b: ByteArray, segPos: Int): Int? {
+    /**
+     * Fin real de la imagen principal: el primer FF D9 después del SOS (en los datos comprimidos un FF va seguido
+     * de 00 o de RSTn, así que el primer FF D9 es el final). No se usa el tamaño del MPF: en las fotos de la stock
+     * queda más corto que la imagen (Motorola agrega datos después) y cortar ahí borra el final de la foto.
+     */
+    fun primaryEnd(b: ByteArray): Int? {
+        var sos = -1
+        var pos = 2
+        while (pos + 4 <= b.size && (b[pos].toInt() and 255) == 0xff) {
+            val m = b[pos + 1].toInt() and 255
+            if (m == 0xda) { sos = pos; break }
+            pos += 2 + (((b[pos + 2].toInt() and 255) shl 8) or (b[pos + 3].toInt() and 255))
+        }
+        if (sos < 0) return null
+        var i = sos + 2
+        while (i + 1 < b.size) {
+            if ((b[i].toInt() and 255) == 0xff && (b[i + 1].toInt() and 255) == 0xd9) return i + 2
+            i++
+        }
+        return null
+    }
+
+    /** Posición del gain map según el MPF, relativa al comienzo del segmento MPF: offset de la 2.ª imagen + 8. */
+    private fun mpfGainStart(b: ByteArray, segPos: Int): Long? {
         val t = segPos + 8
         if (t + 8 > b.size) return null
         val big = b[t] == 'M'.code.toByte()
@@ -241,9 +266,10 @@ object GainMapAdder {
             val n = u16(ifd)
             for (k in 0 until n) {
                 val e = ifd + 2 + k * 12
-                if (u16(e) == 0xb002) {
+                if (u16(e) == 0xb002 && u32(e + 4) >= 32) {
                     val entries = t + u32(e + 8).toInt()
-                    return u32(entries + 4).toInt().takeIf { it > 4 }
+                    val off2 = u32(entries + 16 + 8)
+                    return if (off2 > 0) off2 + 8 else null
                 }
             }
             null
@@ -255,7 +281,7 @@ object GainMapAdder {
      * MPF (queda una JPEG común, idéntica a la foto que se ve en una pantalla sin HDR). Null si no se pudo.
      */
     fun strip(b: ByteArray): ByteArray? {
-        val plen = primaryLength(b) ?: return null
+        val plen = primaryEnd(b) ?: return null
         val p = b.copyOfRange(0, plen)
         val out = java.io.ByteArrayOutputStream(plen)
         out.write(p, 0, 2)
