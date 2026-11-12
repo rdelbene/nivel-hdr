@@ -73,7 +73,7 @@ class HdrTunerActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
-        target = prefs.getFloat("tuneBoost", 2.5f).toDouble()
+        target = LEVELS[levelIndex(prefs.getFloat("tuneBoost", 2.5f).toDouble())]
         buildUi()
 
         // ¿Vino desde "Compartir" en la galería?
@@ -134,21 +134,31 @@ class HdrTunerActivity : Activity() {
         levelLabel = TextView(this).apply { textSize = 16f; setTextColor(Color.WHITE) }
         root.addView(levelLabel)
         // 100..493 -> ×1.00..×4.93
+        // niveles rápidos (los mismos del panel de notificaciones)
+        val presets = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(6), 0, dp(2)) }
+        for ((v, name) in NivelTile.PRESETS) {
+            val b = TextView(this).apply {
+                text = "$name\n×%.1f".format(v); gravity = Gravity.CENTER; textSize = 12f
+                setTextColor(Color.WHITE); setPadding(0, dp(6), 0, dp(6))
+                background = GradientDrawable().apply { cornerRadius = dp(12).toFloat(); setColor(Color.argb(255, 50, 50, 50)) }
+                setOnClickListener { setLevel(levelIndex(v), true) }
+            }
+            presetBtns += b to v
+            presets.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
+        }
+        root.addView(presets)
+
+        // barra con escalones de 0.1 y botones − / + (mantener apretado para avanzar seguido)
         levelBar = SeekBar(this).apply {
-            max = 393
-            progress = ((target - 1.0) * 100).roundToInt().coerceIn(0, 393)
+            max = LEVELS.size - 1
+            progress = levelIndex(target)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { target = 1.0 + p / 100.0; updateLevel() }
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { if (fromUser) { target = LEVELS[p]; updateLevel() } }
                 override fun onStartTrackingTouch(s: SeekBar) {}
-                override fun onStopTrackingTouch(s: SeekBar) {
-                    HdrEngine.setBaseLevel(this@HdrTunerActivity, target)
-                    if (::autoBtn.isInitialized) updateAuto()
-                    NivelTile.refresh(this@HdrTunerActivity)
-                    AutoHdrService.refresh(this@HdrTunerActivity)
-                }
+                override fun onStopTrackingTouch(s: SeekBar) { saveLevel() }
             })
         }
-        root.addView(levelBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(stepperRow(levelBar, { setLevel(levelBar.progress - 1, false) }, { setLevel(levelBar.progress + 1, false) }, ::saveLevel))
         updateLevel()
 
         // automático: el nivel elegido se aplica solo a cada foto nueva de la cámara
@@ -243,7 +253,7 @@ class HdrTunerActivity : Activity() {
         // el nivel pudo cambiar desde el panel de notificaciones
         val b = HdrEngine.baseLevel(this)
         if (::levelBar.isInitialized && kotlin.math.abs(b - target) > 0.005) {
-            target = b; levelBar.progress = ((target - 1.0) * 100).roundToInt().coerceIn(0, 393); updateLevel()
+            setLevel(levelIndex(b), false)
         }
     }
 
@@ -278,12 +288,69 @@ class HdrTunerActivity : Activity() {
 
     private fun updateLevel() {
         val stops = Math.log(target) / Math.log(2.0)
-        levelLabel.text = "Luces hasta ×%.2f  (%.1f pasos) · stock ×%.2f".format(target, stops, STOCK_BOOST) +
+        levelLabel.text = "Nivel: ×%.1f  (%.1f pasos de luz)".format(target, stops) +
             when {
                 target < 1.05 -> " · sin HDR"
                 target >= STOCK_BOOST - 0.01 -> " · igual que la stock"
                 else -> ""
             }
+        for ((b, v) in presetBtns) {
+            val on = kotlin.math.abs(v - target) < 0.02
+            (b.background as GradientDrawable).setColor(if (on) Color.rgb(0, 224, 150) else Color.argb(255, 50, 50, 50))
+            b.setTextColor(if (on) Color.BLACK else Color.WHITE)
+        }
+    }
+
+    private val presetBtns = mutableListOf<Pair<TextView, Double>>()
+
+    private fun levelIndex(v: Double): Int = LEVELS.indices.minByOrNull { kotlin.math.abs(LEVELS[it] - v) } ?: 0
+
+    /** Mueve el nivel a un escalón; [save] guarda enseguida (los botones − / + guardan al soltar). */
+    private fun setLevel(idx: Int, save: Boolean) {
+        val i = idx.coerceIn(0, LEVELS.size - 1)
+        target = LEVELS[i]
+        levelBar.progress = i
+        updateLevel()
+        if (save) saveLevel()
+    }
+
+    private fun saveLevel() {
+        HdrEngine.setBaseLevel(this, target)
+        if (::autoBtn.isInitialized) updateAuto()
+        NivelTile.refresh(this)
+        AutoHdrService.refresh(this)
+    }
+
+    /**
+     * Fila [−] barra [+]. Un toque mueve un escalón; mantener apretado repite (cada vez más rápido).
+     * [onRelease] se llama al soltar, para guardar una sola vez.
+     */
+    private fun stepperRow(bar: SeekBar, minus: () -> Unit, plus: () -> Unit, onRelease: () -> Unit): LinearLayout {
+        fun btn(label: String, act: () -> Unit) = TextView(this).apply {
+            text = label; gravity = Gravity.CENTER; textSize = 22f; typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.argb(255, 50, 50, 50)) }
+            var delay = 350L
+            val repeat = object : Runnable {
+                override fun run() { act(); delay = maxOf(60L, delay - 40L); postDelayed(this, delay) }
+            }
+            setOnTouchListener { v, e ->
+                when (e.actionMasked) {
+                    android.view.MotionEvent.ACTION_DOWN -> { act(); delay = 350L; v.postDelayed(repeat, 450L); v.isPressed = true }
+                    android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                        v.removeCallbacks(repeat); v.isPressed = false; onRelease()
+                        if (e.actionMasked == android.view.MotionEvent.ACTION_UP) v.performClick()
+                    }
+                }
+                true
+            }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(btn("−", minus), LinearLayout.LayoutParams(dp(44), dp(44)))
+            addView(bar, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(btn("+", plus), LinearLayout.LayoutParams(dp(44), dp(44)))
+        }
     }
 
     private fun updateButtons() {
@@ -568,14 +635,17 @@ class HdrTunerActivity : Activity() {
             fun upd(v: Int) { lab.text = "${l.label}: $v % del nivel" }
             upd(HdrEngine.lensPct(this, l))
             lensBox.addView(lab)
-            lensBox.addView(SeekBar(this).apply {
-                max = 150; progress = HdrEngine.lensPct(this@HdrTunerActivity, l)
+            val bar = SeekBar(this).apply {
+                max = 30 // 0 a 150 % en escalones de 5 %
+                progress = (HdrEngine.lensPct(this@HdrTunerActivity, l) + 2) / 5
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { upd(p) }
+                    override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { upd(p * 5) }
                     override fun onStartTrackingTouch(s: SeekBar) {}
-                    override fun onStopTrackingTouch(s: SeekBar) { HdrEngine.setLensPct(this@HdrTunerActivity, l, s.progress); updateAuto() }
+                    override fun onStopTrackingTouch(s: SeekBar) { HdrEngine.setLensPct(this@HdrTunerActivity, l, s.progress * 5); updateAuto() }
                 })
-            })
+            }
+            val save = { HdrEngine.setLensPct(this, l, bar.progress * 5); updateAuto() }
+            lensBox.addView(stepperRow(bar, { bar.progress = (bar.progress - 1).coerceAtLeast(0) }, { bar.progress = (bar.progress + 1).coerceAtMost(30) }, save))
         }
         lensBox.visibility = if (HdrEngine.perLens(this)) View.VISIBLE else View.GONE
         box.addView(sw("Nivel distinto por lente", HdrEngine.perLens(this)) { HdrEngine.setPerLens(this, it); lensBox.visibility = if (it) View.VISIBLE else View.GONE })
@@ -618,6 +688,9 @@ class HdrTunerActivity : Activity() {
     }
 
     companion object {
+        /** Escalones del nivel: ×1.0 a ×4.8 de a 0.1, y ×4.93 (stock). */
+        val LEVELS: List<Double> = (10..48).map { it / 10.0 } + 4.93
+
         /** Clave para guardar en la vista la foto que está cargando (cualquier id de recurso único sirve). */
         private const val R_TAG_URI = 0x7f0f0001
     }
