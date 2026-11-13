@@ -60,7 +60,13 @@ class HdrTunerActivity : Activity() {
     private var onlyPending = false
     private val allItems = mutableListOf<Uri>()
     /** Datos de cada foto para la grilla: nombre y nivel actual (null = sin Ultra HDR). */
-    private class Meta(val name: String, val level: Double?, val pending: Boolean)
+    /** Datos de cada foto para la grilla (se leen a medida que aparecen en pantalla). */
+    private class Meta(val level: Double?, val lens: String?, val zoom: Double?, val crop: Double)
+    private val names = java.util.concurrent.ConcurrentHashMap<Uri, String>()
+    private val metaLoading = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Uri, Boolean>())
+    private val metaExec = java.util.concurrent.Executors.newFixedThreadPool(2)
+    private var refreshPosted = false
+    private fun isPending(u: Uri) = !(names[u] ?: "").contains("_HDRx")
     private val metas = java.util.concurrent.ConcurrentHashMap<Uri, Meta>()
     private lateinit var status: TextView
     private lateinit var grid: GridView
@@ -118,19 +124,18 @@ class HdrTunerActivity : Activity() {
             setBackgroundColor(Color.BLACK)
             setPadding(dp(12), dp(36), dp(12), dp(16))
         }
-        root.addView(TextView(this).apply {
-            text = "Nivel HDR"
-            textSize = 24f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-        })
-        root.addView(TextView(this).apply {
-            text = "Elegí cuánta luz extra agrega el Ultra HDR. La imagen no se toca y se puede volver a cambiar. " +
-                "También se puede cambiar desde el panel de notificaciones (botón \"Nivel HDR\")."
-            textSize = 13f
-            setTextColor(Color.LTGRAY)
-            setPadding(0, dp(4), 0, dp(8))
-        })
+        // encabezado: título, ⓘ (explicaciones) y ⋮ (Ajustes, Volver todo atrás)
+        val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        header.addView(TextView(this).apply {
+            text = "Nivel HDR"; textSize = 24f; typeface = Typeface.DEFAULT_BOLD; setTextColor(Color.WHITE)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        fun iconBtn(t: String, act: (View) -> Unit) = TextView(this).apply {
+            text = t; gravity = Gravity.CENTER; textSize = 22f; setTextColor(Color.WHITE)
+            setOnClickListener { act(it) }
+        }
+        header.addView(iconBtn("ⓘ") { showInfo() }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        header.addView(iconBtn("⋮") { showMenu(it) }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        root.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(6) })
         levelLabel = TextView(this).apply { textSize = 16f; setTextColor(Color.WHITE) }
         root.addView(levelLabel)
         // 100..493 -> ×1.00..×4.93
@@ -164,29 +169,23 @@ class HdrTunerActivity : Activity() {
         // automático: el nivel elegido se aplica solo a cada foto nueva de la cámara
         autoBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { toggleAuto() }
         root.addView(autoBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(6), 0, 0) }
-        val btnSettings = pillButton("Ajustes", Color.argb(255, 50, 50, 50), Color.WHITE) { showSettings() }
-        val btnRevert = pillButton("Volver todo atrás", Color.argb(255, 50, 50, 50), Color.WHITE) { confirmRevert() }
-        tools.addView(btnSettings, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
-        tools.addView(btnRevert, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6) })
-        root.addView(tools)
-        summary = TextView(this).apply { textSize = 12f; setTextColor(Color.LTGRAY); setPadding(0, dp(6), 0, 0) }
-        root.addView(summary)
+        summary = TextView(this) // el resumen de ajustes ahora va en ⓘ
         updateAuto()
 
         status = TextView(this).apply {
             textSize = 13f
             setTextColor(Color.rgb(0, 224, 150))
             setPadding(0, dp(6), 0, dp(6))
-            text = "Tocá las fotos para elegirlas."
+            text = ""
         }
         root.addView(status)
 
         filterBtn = TextView(this).apply {
-            textSize = 13f; setTextColor(Color.WHITE); setPadding(0, dp(2), 0, dp(6))
+            textSize = 13f; setTextColor(Color.WHITE); setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(255, 50, 50, 50)) }
             setOnClickListener { onlyPending = !onlyPending; applyFilter() }
         }
-        root.addView(filterBtn)
+        root.addView(filterBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(6) })
 
         grid = GridView(this).apply {
             numColumns = 3
@@ -386,17 +385,20 @@ class HdrTunerActivity : Activity() {
             val chk = cell.findViewWithTag<TextView>("chk")
             val lvl = cell.findViewWithTag<TextView>("lvl")
             val meta = metas[uri]
-            if (meta == null) lvl.visibility = View.GONE else {
+            if (meta == null) { lvl.visibility = View.GONE; loadMeta(uri) } else {
+                val pending = isPending(uri)
                 lvl.visibility = View.VISIBLE
-                lvl.text = when {
-                    meta.level == null -> "sin HDR"
-                    meta.pending -> "×%.1f · sin ajustar".format(meta.level)
-                    else -> "×%.1f".format(meta.level)
-                }
-                lvl.setTextColor(if (meta.pending) Color.BLACK else Color.WHITE)
+                // lente · zoom (si hay recorte) · nivel
+                val parts = mutableListOf<String>()
+                meta.lens?.let { parts += it }
+                meta.zoom?.let { z -> if (meta.crop > 1.05) parts += if (z >= 10) "%.0fx".format(z) else "%.1fx".format(z) }
+                parts += if (meta.level == null) "sin HDR" else "×%.1f".format(meta.level)
+                if (pending && meta.level != null) parts += "sin ajustar"
+                lvl.text = parts.joinToString(" · ")
+                lvl.setTextColor(if (pending) Color.BLACK else Color.WHITE)
                 lvl.background = GradientDrawable().apply {
                     cornerRadius = dp(8).toFloat()
-                    setColor(if (meta.pending) Color.rgb(255, 170, 0) else Color.argb(170, 0, 0, 0))
+                    setColor(if (pending) Color.rgb(255, 170, 0) else Color.argb(170, 0, 0, 0))
                 }
             }
             val sel = uri in selected
@@ -442,7 +444,7 @@ class HdrTunerActivity : Activity() {
     private fun loadRecent() {
         io.execute {
             val list = mutableListOf<Uri>()
-            val names = HashMap<Uri, String>()
+            val nm = HashMap<Uri, String>()
             try {
                 contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -451,26 +453,42 @@ class HdrTunerActivity : Activity() {
                     arrayOf("DCIM/Camera%", "image/jpeg"),
                     "${MediaStore.MediaColumns.DATE_ADDED} DESC"
                 )?.use { c ->
-                    while (c.moveToNext() && list.size < 150) {
+                    // todas las fotos de la cámara (el nivel, el lente y el zoom se leen después, al verlas)
+                    while (c.moveToNext()) {
                         val u = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
-                        list += u; names[u] = c.getString(1) ?: ""
+                        list += u; nm[u] = c.getString(1) ?: ""
                     }
                 }
             } catch (e: Exception) {
                 main.post { status.text = "No pude leer la galería: ${e.message}" }
             }
             main.post {
+                names.clear(); names.putAll(nm)
+                metas.clear(); metaLoading.clear()
                 allItems.clear(); allItems += list
                 applyFilter()
-                status.text = if (list.isEmpty()) "No encontré fotos en DCIM/Camera." else "Tocá las fotos para elegirlas (${list.size} recientes)."
+                status.text = if (list.isEmpty()) "No encontré fotos en DCIM/Camera." else ""
             }
-            // nivel de cada foto (lectura parcial del archivo: encabezado + comienzo del gain map)
-            for (u in list) {
-                val lv = try { readLevel(u) } catch (_: Exception) { null }
-                val name = names[u] ?: ""
-                metas[u] = Meta(name, lv, !name.contains("_HDRx"))
+        }
+    }
+
+    /** Lee nivel, lente y zoom de una foto (en segundo plano) y refresca la grilla. */
+    private fun loadMeta(u: Uri) {
+        if (!metaLoading.add(u)) return
+        metaExec.execute {
+            val lv = try { readLevel(u) } catch (_: Exception) { null }
+            var lens: String? = null; var zoom: Double? = null; var crop = 1.0
+            try {
+                contentResolver.openInputStream(u)?.use { st ->
+                    val ex = android.media.ExifInterface(st)
+                    lens = HdrEngine.lensOf(ex).label
+                    HdrEngine.zoomOf(ex)?.let { zoom = it.total; crop = it.crop }
+                }
+            } catch (_: Exception) {}
+            metas[u] = Meta(lv, lens, zoom, crop)
+            main.post {
+                if (!refreshPosted) { refreshPosted = true; main.postDelayed({ refreshPosted = false; adapter.notifyDataSetChanged() }, 250) }
             }
-            main.post { applyFilter() }
         }
     }
 
@@ -587,9 +605,9 @@ class HdrTunerActivity : Activity() {
 
     private fun applyFilter() {
         items.clear()
-        items += if (onlyPending) allItems.filter { metas[it]?.pending != false } else allItems
-        val pend = allItems.count { metas[it]?.pending == true }
-        filterBtn.text = if (onlyPending) "Mostrando: sin ajustar ($pend) · tocá para ver todas" else "Mostrando: todas · tocá para ver solo las sin ajustar ($pend)"
+        items += if (onlyPending) allItems.filter { isPending(it) } else allItems
+        val pend = allItems.count { isPending(it) }
+        filterBtn.text = if (onlyPending) "Viendo: sin ajustar ($pend) ▾" else "Viendo: todas (${allItems.size}) ▾"
         adapter.notifyDataSetChanged()
     }
 
@@ -610,6 +628,43 @@ class HdrTunerActivity : Activity() {
         return null
     }
 
+    // ------------------------------------------------------------------ menú e información
+
+    private fun showMenu(anchor: View) {
+        val pm = android.widget.PopupMenu(this, anchor)
+        pm.menu.add(0, 1, 0, "Ajustes")
+        pm.menu.add(0, 2, 1, "Volver todo atrás")
+        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert() }; true }
+        pm.show()
+    }
+
+    private fun showInfo() {
+        val c = this
+        val txt = buildString {
+            append("Elegí cuánta luz extra agrega el Ultra HDR. La imagen no se toca: solo cambia la intensidad, y se puede volver a cambiar.\n\n")
+            append("• Nivel: ×1 es sin Ultra HDR y ×4.9 es lo que pone la cámara de Motorola. Usá los botones rápidos, la barra (de a 0.1) o − y + (mantener apretado para avanzar seguido).\n\n")
+            append("• Automático: cada foto nueva de la cámara se ajusta sola a los pocos segundos. Queda corriendo con una notificación fija.\n\n")
+            append("• Panel de notificaciones: el botón \"Nivel HDR\" cambia el nivel sin abrir la app.\n\n")
+            append("• Nombre: cada foto ajustada termina en _HDRx2.5 (el nivel final que quedó).\n\n")
+            append("• Grilla: lente · zoom · nivel. En naranja, las que todavía no ajustó la app. Arriba de la grilla podés ver todas o solo las sin ajustar.\n\n")
+            append("• Para ajustar fotos a mano: tocalas y usá \"Guardar copia\" o \"Reemplazar\".\n\n")
+            append("• Menú ⋮: Ajustes y Volver todo atrás.\n\n")
+            append("Ajustes actuales:\n")
+            append("• Estilo: " + (if (HdrEngine.style(c) == "luces") "solo las luces" else "como la stock") + "\n")
+            append("• Agregar Ultra HDR a x0.5, x3 y frontal: " + (if (AutoHdr.addOn(c)) "sí" else "no") + "\n")
+            append("• Nivel según el zoom: " + (if (HdrEngine.zoomOn(c)) "sí" else "no") + "\n")
+            append("• Nivel según la escena: " + (if (HdrEngine.sceneOn(c)) "sí" else "no") + "\n")
+            append("• Nivel por lente: " + (if (HdrEngine.perLens(c)) HdrEngine.Lens.values().joinToString(", ") { it.label + " " + HdrEngine.lensPct(c, it) + " %" } else "no"))
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Cómo funciona")
+            .setView(android.widget.ScrollView(this).apply {
+                addView(TextView(c).apply { text = txt; textSize = 14f; setPadding(dp(20), dp(8), dp(20), dp(8)) })
+            })
+            .setPositiveButton("Listo", null)
+            .show()
+    }
+
     // ------------------------------------------------------------------ ajustes
 
     private fun showSettings() {
@@ -625,6 +680,9 @@ class HdrTunerActivity : Activity() {
 
         box.addView(sw("Estilo: solo las luces", HdrEngine.style(this) == "luces") { HdrEngine.setStyle(this, if (it) "luces" else "stock") })
         box.addView(note("Apagado: como la stock (ilumina casi toda la foto). Prendido: la foto queda normal y brillan solo cielo, lámparas y reflejos."))
+
+        box.addView(sw("Nivel según el zoom", HdrEngine.zoomOn(this)) { HdrEngine.setZoomOn(this, it) })
+        box.addView(note("Con zoom digital (recorte) baja el Ultra HDR: hasta 2x nada · 2x a 5x 80 % · 5x a 15x 60 % · más 40 %. Ejemplo: x3 a 25x = recorte 8x → 60 %."))
 
         box.addView(sw("Nivel según la escena", HdrEngine.sceneOn(this)) { HdrEngine.setScene(this, it) })
         box.addView(note("Noche: menos (×0.6 en pasos) · contraluz o muy clara: ×0.8 · escena apagada: ×1.2. El nombre muestra el nivel final."))

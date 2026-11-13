@@ -31,6 +31,8 @@ object HdrEngine {
     fun setPerLens(ctx: Context, on: Boolean) = p(ctx).edit().putBoolean("perLens", on).apply()
     fun lensPct(ctx: Context, l: Lens) = p(ctx).getInt(l.key, l.defPct)
     fun setLensPct(ctx: Context, l: Lens, v: Int) = p(ctx).edit().putInt(l.key, v).apply()
+    fun zoomOn(ctx: Context) = p(ctx).getBoolean("zoomLevel", true)
+    fun setZoomOn(ctx: Context, on: Boolean) = p(ctx).edit().putBoolean("zoomLevel", on).apply()
     fun sceneOn(ctx: Context) = p(ctx).getBoolean("scene", false)
     fun setScene(ctx: Context, on: Boolean) = p(ctx).edit().putBoolean("scene", on).apply()
     /** "stock" (ilumina casi toda la foto, como Motorola) o "luces" (solo cielo, lámparas, reflejos). */
@@ -45,18 +47,46 @@ object HdrEngine {
      */
     fun detectLens(src: ByteArray, nativeUhdr: Boolean): Lens {
         if (nativeUhdr) return Lens.MAIN
-        return try {
-            val ex = ExifInterface(ByteArrayInputStream(src))
-            val eq = ex.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0)
-            val f = ex.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0)
-            when {
-                eq in 1..17 -> Lens.UW
-                eq > 50 -> Lens.TELE
-                f > 0.0 && f < 4.0 && eq in 18..40 -> Lens.FRONT
-                f > 0.0 && f < 4.0 && eq == 0 -> Lens.FRONT
-                else -> Lens.MAIN
-            }
-        } catch (_: Exception) { Lens.MAIN }
+        return try { lensOf(ExifInterface(ByteArrayInputStream(src))) } catch (_: Exception) { Lens.MAIN }
+    }
+
+    /** Lente según el EXIF (verificado con fotos reales: x0.5 = 12 mm eq / 1.83 mm, x1 = 23 / 6.57, x3 = 71 / 13.3). */
+    fun lensOf(ex: ExifInterface): Lens {
+        val eq = ex.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0)
+        val f = ex.getAttributeDouble(ExifInterface.TAG_FOCAL_LENGTH, 0.0)
+        return when {
+            eq in 1..17 -> Lens.UW
+            eq > 50 -> Lens.TELE
+            f > 0.0 && f < 4.0 && eq in 18..40 -> Lens.FRONT
+            f > 0.0 && f < 4.0 && eq == 0 -> Lens.FRONT
+            else -> Lens.MAIN
+        }
+    }
+
+    // ------------------------------------------------------------------ zoom
+
+    /**
+     * Zoom de la foto según el EXIF. Motorola guarda en DigitalZoomRatio el zoom TOTAL que muestra la cámara
+     * (0.5 con la x0.5, 2.0 con la x1 a 2x, 25.4 con la x3 a ~25x). El lente sale del equivalente 35 mm ÷ 23 mm
+     * (el de la x1), y el recorte real es zoom total ÷ lente.
+     */
+    class Zoom(val total: Double, val lens: Double, val crop: Double)
+
+    fun zoomOf(ex: ExifInterface): Zoom? {
+        val eq = ex.getAttributeInt(ExifInterface.TAG_FOCAL_LENGTH_IN_35MM_FILM, 0)
+        if (eq <= 0) return null
+        val lensF = eq / 23.0
+        val dz = ex.getAttributeDouble(ExifInterface.TAG_DIGITAL_ZOOM_RATIO, 0.0)
+        val total = if (dz > 0.0) dz else lensF
+        return Zoom(total, lensF, (total / lensF).coerceAtLeast(1.0))
+    }
+
+    /** Cuánto se baja el Ultra HDR (en pasos) según el recorte: hasta 2x nada, 2-5x 80 %, 5-15x 60 %, más 40 %. */
+    fun zoomFactor(crop: Double) = when {
+        crop <= 2.05 -> 1.0
+        crop <= 5.0 -> 0.8
+        crop <= 15.0 -> 0.6
+        else -> 0.4
     }
 
     // ------------------------------------------------------------------ escena
@@ -102,10 +132,15 @@ object HdrEngine {
     fun levelFor(ctx: Context, src: ByteArray, nativeUhdr: Boolean, baseOverride: Double? = null): Plan {
         val base = baseOverride ?: baseLevel(ctx)
         var stops = ln(base.coerceAtLeast(1.0)) / ln(2.0)
-        val lens = detectLens(src, nativeUhdr)
+        val ex = try { ExifInterface(ByteArrayInputStream(src)) } catch (_: Exception) { null }
+        val lens = if (nativeUhdr || ex == null) Lens.MAIN else lensOf(ex)
         if (perLens(ctx)) stops *= lensPct(ctx, lens) / 100.0
         var why = ""
-        if (sceneOn(ctx) && stops > 0.0) { val sc = scene(src); stops *= sc.factor; why = sc.why }
+        if (zoomOn(ctx) && ex != null) {
+            val z = zoomOf(ex)
+            if (z != null && z.crop > 2.05) { stops *= zoomFactor(z.crop); why = "zoom %.0fx".format(z.total) }
+        }
+        if (sceneOn(ctx) && stops > 0.0) { val sc = scene(src); stops *= sc.factor; if (sc.why.isNotEmpty()) why = if (why.isEmpty()) sc.why else "$why, ${sc.why}" }
         stops = stops.coerceIn(0.0, STOCK_STOPS)
         return Plan(2.0.pow(stops), lens, why)
     }
