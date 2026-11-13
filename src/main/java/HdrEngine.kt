@@ -19,7 +19,7 @@ object HdrEngine {
     private const val PREFS = "cfg"
 
     enum class Lens(val label: String, val key: String, val defPct: Int) {
-        MAIN("x1", "pctMain", 100), UW("x0.5", "pctUw", 100), TELE("x3", "pctTele", 100), FRONT("frontal", "pctFront", 60)
+        MAIN("1x", "pctMain", 100), UW("0.5x", "pctUw", 100), TELE("3x", "pctTele", 100), FRONT("frontal", "pctFront", 60)
     }
 
     // ------------------------------------------------------------------ ajustes

@@ -391,8 +391,8 @@ class HdrTunerActivity : Activity() {
                 // lente · zoom (si hay recorte) · nivel
                 val parts = mutableListOf<String>()
                 meta.lens?.let { parts += it }
-                meta.zoom?.let { z -> if (meta.crop > 1.05) parts += if (z >= 10) "%.0fx".format(z) else "%.1fx".format(z) }
-                parts += if (meta.level == null) "sin HDR" else "×%.1f".format(meta.level)
+                meta.zoom?.let { z -> if (meta.crop > 1.05) parts += if (z >= 10) "zoom %.0f".format(z) else "zoom %.1f".format(z) }
+                parts += if (meta.level == null) "sin HDR" else "HDR %.1f".format(meta.level)
                 if (pending && meta.level != null) parts += "sin ajustar"
                 lvl.text = parts.joinToString(" · ")
                 lvl.setTextColor(if (pending) Color.BLACK else Color.WHITE)
@@ -646,7 +646,7 @@ class HdrTunerActivity : Activity() {
             append("• Automático: cada foto nueva de la cámara se ajusta sola a los pocos segundos. Queda corriendo con una notificación fija.\n\n")
             append("• Panel de notificaciones: el botón \"Nivel HDR\" cambia el nivel sin abrir la app.\n\n")
             append("• Nombre: cada foto ajustada termina en _HDRx2.5 (el nivel final que quedó).\n\n")
-            append("• Grilla: lente · zoom · nivel. En naranja, las que todavía no ajustó la app. Arriba de la grilla podés ver todas o solo las sin ajustar.\n\n")
+            append("• Grilla: lente · zoom · nivel, por ejemplo \"0.5x · zoom 1.8 · HDR 2.4\". El zoom aparece solo si la cámara recortó. En naranja, las que todavía no ajustó la app. Arriba de la grilla podés ver todas o solo las sin ajustar.\n\n")
             append("• Para ajustar fotos a mano: tocalas y usá \"Guardar copia\" o \"Reemplazar\".\n\n")
             append("• Menú ⋮: Ajustes y Volver todo atrás.\n\n")
             append("Ajustes actuales:\n")
