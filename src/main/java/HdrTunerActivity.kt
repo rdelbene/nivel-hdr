@@ -168,6 +168,7 @@ class HdrTunerActivity : Activity() {
 
         // automático: el nivel elegido se aplica solo a cada foto nueva de la cámara
         autoBtn = pillButton("", Color.argb(255, 50, 50, 50), Color.WHITE) { toggleAuto() }
+        autoBtn.setPadding(dp(16), dp(7), dp(16), dp(7))
         root.addView(autoBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
         summary = TextView(this) // el resumen de ajustes ahora va en ⓘ
         updateAuto()
@@ -267,11 +268,9 @@ class HdrTunerActivity : Activity() {
 
     private fun updateAuto() {
         val on = AutoHdr.isOn(this) && AutoHdr.canWrite()
-        val n = getSharedPreferences("cfg", Context.MODE_PRIVATE).getInt("autoCount", 0)
         val batOk = getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
-        autoBtn.text = if (on && !batOk) "Automático: PRENDIDO pero con ahorro de batería · tocá para corregir"
-            else if (on) "Automático: PRENDIDO · fotos nuevas a ×%.2f (%d ajustadas)".format(AutoHdr.level(this), n)
-            else "Automático: apagado · tocá para aplicar este nivel a cada foto nueva"
+        // verde = prendido, gris = apagado; solo se avisa si el ahorro de batería lo puede frenar
+        autoBtn.text = if (on && !batOk) "Automático · ⚠ ahorro de batería" else "Automático"
         (autoBtn.background as GradientDrawable).setColor(if (on) Color.rgb(0, 224, 150) else Color.argb(255, 50, 50, 50))
         autoBtn.setTextColor(if (on) Color.BLACK else Color.WHITE)
         if (::summary.isInitialized) {
