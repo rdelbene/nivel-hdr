@@ -31,6 +31,31 @@ object HdrEngine {
     fun setPerLens(ctx: Context, on: Boolean) = p(ctx).edit().putBoolean("perLens", on).apply()
     fun lensPct(ctx: Context, l: Lens) = p(ctx).getInt(l.key, l.defPct)
     fun setLensPct(ctx: Context, l: Lens, v: Int) = p(ctx).edit().putInt(l.key, v).apply()
+    /**
+     * Ultra HDR prendido o apagado en cada lente (automático). Apagado: la x1 queda en ×1 (sin luz extra,
+     * se puede volver a subir) y a x0.5, x3 y frontal no se les agrega. Por defecto x0.5/x3/frontal siguen
+     * al ajuste viejo "Agregar Ultra HDR a x0.5, x3 y frontal".
+     */
+    fun lensOn(ctx: Context, l: Lens) = p(ctx).getBoolean("on_" + l.key, if (l == Lens.MAIN) true else p(ctx).getBoolean("autoAdd", true))
+    fun setLensOn(ctx: Context, l: Lens, on: Boolean) = p(ctx).edit().putBoolean("on_" + l.key, on).apply()
+
+    /** Tramos de zoom digital (recorte) con su porcentaje, editables. */
+    enum class ZoomBand(val label: String, val key: String, val upTo: Double, val defPct: Int) {
+        Z1("Recorte hasta 2x", "zPct1", 2.05, 100), Z2("Recorte 2x a 5x", "zPct2", 5.0, 80),
+        Z3("Recorte 5x a 15x", "zPct3", 15.0, 60), Z4("Recorte más de 15x", "zPct4", Double.MAX_VALUE, 40)
+    }
+    fun zoomPct(ctx: Context, b: ZoomBand) = p(ctx).getInt(b.key, b.defPct)
+    fun setZoomPct(ctx: Context, b: ZoomBand, v: Int) = p(ctx).edit().putInt(b.key, v).apply()
+
+    /** Escenas con su porcentaje, editables. */
+    enum class SceneKind(val label: String, val why: String, val key: String, val defPct: Int) {
+        NIGHT("Noche (muy oscura)", "noche", "sPctNight", 60), LIGHTS("Luces fuertes / contraluz", "luces fuertes", "sPctLights", 80),
+        BRIGHT("Escena muy clara", "muy clara", "sPctBright", 80), FLAT("Escena apagada, sin luces", "apagada", "sPctFlat", 120),
+        NORMAL("Normal", "normal", "sPctNormal", 100)
+    }
+    fun scenePct(ctx: Context, k: SceneKind) = p(ctx).getInt(k.key, k.defPct)
+    fun setScenePct(ctx: Context, k: SceneKind, v: Int) = p(ctx).edit().putInt(k.key, v).apply()
+
     fun zoomOn(ctx: Context) = p(ctx).getBoolean("zoomLevel", true)
     fun setZoomOn(ctx: Context, on: Boolean) = p(ctx).edit().putBoolean("zoomLevel", on).apply()
     fun sceneOn(ctx: Context) = p(ctx).getBoolean("scene", false)
@@ -81,17 +106,12 @@ object HdrEngine {
         return Zoom(total, lensF, (total / lensF).coerceAtLeast(1.0))
     }
 
-    /** Cuánto se baja el Ultra HDR (en pasos) según el recorte: hasta 2x nada, 2-5x 80 %, 5-15x 60 %, más 40 %. */
-    fun zoomFactor(crop: Double) = when {
-        crop <= 2.05 -> 1.0
-        crop <= 5.0 -> 0.8
-        crop <= 15.0 -> 0.6
-        else -> 0.4
-    }
+    /** Tramo de zoom según el recorte. */
+    fun zoomBand(crop: Double) = ZoomBand.values().first { crop <= it.upTo }
 
     // ------------------------------------------------------------------ escena
 
-    class Scene(val factor: Double, val why: String)
+    class Scene(val kind: SceneKind?)
 
     private fun decodeSmall(src: ByteArray, sample: Int): Bitmap? =
         BitmapFactory.decodeByteArray(src, 0, src.size, BitmapFactory.Options().apply { inSampleSize = sample })
@@ -101,7 +121,7 @@ object HdrEngine {
      *  noche (muy oscura) ×0.6 · contraluz / luces fuertes ×0.8 · escena muy clara ×0.8 · apagada, sin luces ×1.2.
      */
     fun scene(src: ByteArray): Scene {
-        val bmp = decodeSmall(src, 16) ?: return Scene(1.0, "")
+        val bmp = decodeSmall(src, 16) ?: return Scene(null)
         val w = bmp.width; val h = bmp.height
         val px = IntArray(w * h); bmp.getPixels(px, 0, w, 0, 0, w, h); bmp.recycle()
         val hist = IntArray(256)
@@ -117,11 +137,11 @@ object HdrEngine {
         var clip = 0; for (k in 250..255) clip += hist[k]
         val clipF = clip.toDouble() / n
         return when {
-            mean < 50 -> Scene(0.6, "noche")
-            clipF > 0.06 -> Scene(0.8, "luces fuertes")
-            mean > 170 -> Scene(0.8, "muy clara")
-            p95 - p5 < 120 && mean in 60.0..150.0 -> Scene(1.2, "apagada")
-            else -> Scene(1.0, "normal")
+            mean < 50 -> Scene(SceneKind.NIGHT)
+            clipF > 0.06 -> Scene(SceneKind.LIGHTS)
+            mean > 170 -> Scene(SceneKind.BRIGHT)
+            p95 - p5 < 120 && mean in 60.0..150.0 -> Scene(SceneKind.FLAT)
+            else -> Scene(SceneKind.NORMAL)
         }
     }
 
@@ -138,9 +158,18 @@ object HdrEngine {
         var why = ""
         if (zoomOn(ctx) && ex != null) {
             val z = zoomOf(ex)
-            if (z != null && z.crop > 2.05) { stops *= zoomFactor(z.crop); why = "zoom %.0fx".format(z.total) }
+            if (z != null) {
+                val pct = zoomPct(ctx, zoomBand(z.crop))
+                if (pct != 100) { stops *= pct / 100.0; why = "zoom %.0fx".format(z.total) }
+            }
         }
-        if (sceneOn(ctx) && stops > 0.0) { val sc = scene(src); stops *= sc.factor; if (sc.why.isNotEmpty()) why = if (why.isEmpty()) sc.why else "$why, ${sc.why}" }
+        if (sceneOn(ctx) && stops > 0.0) {
+            val k = scene(src).kind
+            if (k != null) {
+                stops *= scenePct(ctx, k) / 100.0
+                if (k != SceneKind.NORMAL) why = if (why.isEmpty()) k.why else "$why, ${k.why}"
+            }
+        }
         stops = stops.coerceIn(0.0, STOCK_STOPS)
         return Plan(2.0.pow(stops), lens, why)
     }
@@ -166,11 +195,21 @@ object HdrEngine {
      * Arma la foto con el nivel que corresponde. [allowAdd]: agregar Ultra HDR si no tiene.
      * Devuelve null si no hay nada que hacer (ya está igual o no se puede).
      */
-    fun render(ctx: Context, src: ByteArray, allowAdd: Boolean, baseOverride: Double? = null, styleOverride: String? = null): Result? {
+    fun render(ctx: Context, src: ByteArray, allowAdd: Boolean, baseOverride: Double? = null, styleOverride: String? = null,
+               lensRules: Boolean = false): Result? {
         val info = UltraHdrTuner.analyze(src)
         val marks = GainMapAdder.marks(src)
         val native = info != null && (marks == null || !marks.added)
         val plan = levelFor(ctx, src, native, baseOverride)
+        // automático con el Ultra HDR apagado en este lente
+        if (lensRules && !lensOn(ctx, plan.lens)) {
+            if (info == null) return null // no tiene y no se le agrega
+            if (!native) { val plain = GainMapAdder.strip(src) ?: return null; return Result(plain, 1.0, plan.lens, "", "sacada") }
+            // el original de la stock queda en ×1 (sin luz extra): se puede volver a subir cuando quieras
+            if (kotlin.math.abs(info.maxBoost - 1.0) < 0.02) return Result(src, 1.0, plan.lens, "", "igual")
+            val out = UltraHdrTuner.setMaxBoost(src, 1.0) ?: return null
+            return Result(out, 1.0, plan.lens, "", "apagada")
+        }
         val st = styleOverride ?: style(ctx)
         val curStyle = marks?.style ?: "stock"
         val stops = ln(plan.boost) / ln(2.0)

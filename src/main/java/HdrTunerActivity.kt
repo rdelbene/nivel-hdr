@@ -277,7 +277,8 @@ class HdrTunerActivity : Activity() {
         if (::summary.isInitialized) {
             summary.text = buildString {
                 append("Estilo: " + (if (HdrEngine.style(this@HdrTunerActivity) == "luces") "solo las luces" else "como la stock"))
-                append(" · x0.5/x3/frontal: " + (if (AutoHdr.addOn(this@HdrTunerActivity)) "se les agrega" else "no"))
+                val off = HdrEngine.Lens.values().filter { !HdrEngine.lensOn(this@HdrTunerActivity, it) }
+                if (off.isNotEmpty()) append(" · sin Ultra HDR: " + off.joinToString(" ") { it.label })
                 if (HdrEngine.perLens(this@HdrTunerActivity)) append(" · por lente: " + HdrEngine.Lens.values().joinToString(" ") {
                     it.label + " " + HdrEngine.lensPct(this@HdrTunerActivity, it) + "%" })
                 if (HdrEngine.sceneOn(this@HdrTunerActivity)) append(" · según escena")
@@ -651,9 +652,9 @@ class HdrTunerActivity : Activity() {
             append("• Menú ⋮: Ajustes y Volver todo atrás.\n\n")
             append("Ajustes actuales:\n")
             append("• Estilo: " + (if (HdrEngine.style(c) == "luces") "solo las luces" else "como la stock") + "\n")
-            append("• Agregar Ultra HDR a x0.5, x3 y frontal: " + (if (AutoHdr.addOn(c)) "sí" else "no") + "\n")
-            append("• Nivel según el zoom: " + (if (HdrEngine.zoomOn(c)) "sí" else "no") + "\n")
-            append("• Nivel según la escena: " + (if (HdrEngine.sceneOn(c)) "sí" else "no") + "\n")
+            append("• Ultra HDR por lente: " + HdrEngine.Lens.values().joinToString(", ") { it.label + " " + (if (HdrEngine.lensOn(c, it)) "sí" else "no") } + "\n")
+            append("• Nivel según el zoom: " + (if (HdrEngine.zoomOn(c)) HdrEngine.ZoomBand.values().joinToString(", ") { it.label.removePrefix("Recorte ") + " " + HdrEngine.zoomPct(c, it) + " %" } else "no") + "\n")
+            append("• Nivel según la escena: " + (if (HdrEngine.sceneOn(c)) HdrEngine.SceneKind.values().joinToString(", ") { it.why + " " + HdrEngine.scenePct(c, it) + " %" } else "no") + "\n")
             append("• Nivel por lente: " + (if (HdrEngine.perLens(c)) HdrEngine.Lens.values().joinToString(", ") { it.label + " " + HdrEngine.lensPct(c, it) + " %" } else "no"))
         }
         android.app.AlertDialog.Builder(this)
@@ -675,40 +676,59 @@ class HdrTunerActivity : Activity() {
         }
         fun note(t: String) = TextView(this).apply { text = t; textSize = 12f; setTextColor(Color.GRAY); setPadding(0, 0, 0, dp(6)) }
 
-        box.addView(sw("Agregar Ultra HDR a x0.5, x3 y frontal", AutoHdr.addOn(this)) { AutoHdr.setAdd(this, it) })
-        box.addView(note("Con la misma curva que usa Motorola en la x1. La foto no se recomprime."))
+        // ---- Ultra HDR por lente
+        box.addView(TextView(this).apply { text = "Ultra HDR por lente"; textSize = 16f; typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(6), 0, dp(2)) })
+        val lensOrder = listOf(HdrEngine.Lens.UW, HdrEngine.Lens.MAIN, HdrEngine.Lens.TELE, HdrEngine.Lens.FRONT)
+        for (l in lensOrder) {
+            val name = when (l) { HdrEngine.Lens.UW -> "x0.5"; HdrEngine.Lens.MAIN -> "x1"; HdrEngine.Lens.TELE -> "x3"; HdrEngine.Lens.FRONT -> "Frontal" }
+            box.addView(sw(name, HdrEngine.lensOn(this, l)) { HdrEngine.setLensOn(this, l, it) })
+        }
+        box.addView(note("Para el automático. Apagado en la x1: la foto queda en ×1 (sin luz extra, se puede volver a subir). " +
+            "Apagado en x0.5, x3 o frontal: no se les agrega. Prendido en esas: se agrega con la misma curva de la x1, sin recomprimir."))
 
         box.addView(sw("Estilo: solo las luces", HdrEngine.style(this) == "luces") { HdrEngine.setStyle(this, if (it) "luces" else "stock") })
         box.addView(note("Apagado: como la stock (ilumina casi toda la foto). Prendido: la foto queda normal y brillan solo cielo, lámparas y reflejos."))
 
-        box.addView(sw("Nivel según el zoom", HdrEngine.zoomOn(this)) { HdrEngine.setZoomOn(this, it) })
-        box.addView(note("Con zoom digital (recorte) baja el Ultra HDR: hasta 2x nada · 2x a 5x 80 % · 5x a 15x 60 % · más 40 %. Ejemplo: x3 a 25x = recorte 8x → 60 %."))
-
-        box.addView(sw("Nivel según la escena", HdrEngine.sceneOn(this)) { HdrEngine.setScene(this, it) })
-        box.addView(note("Noche: menos (×0.6 en pasos) · contraluz o muy clara: ×0.8 · escena apagada: ×1.2. El nombre muestra el nivel final."))
-
-        val lensBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        for (l in HdrEngine.Lens.values()) {
-            val lab = TextView(this).apply { textSize = 13f }
-            fun upd(v: Int) { lab.text = "${l.label}: $v % del nivel" }
-            upd(HdrEngine.lensPct(this, l))
-            lensBox.addView(lab)
+        // fila de porcentaje: etiqueta + − barra + (0 a 200 % de a 5 %)
+        fun pctRow(target: LinearLayout, label: String, get: () -> Int, set: (Int) -> Unit) {
+            val lab = TextView(this).apply { textSize = 13f; setPadding(0, dp(6), 0, 0) }
+            fun upd(v: Int) { lab.text = "$label: $v % del nivel" }
+            upd(get())
+            target.addView(lab)
             val bar = SeekBar(this).apply {
-                max = 30 // 0 a 150 % en escalones de 5 %
-                progress = (HdrEngine.lensPct(this@HdrTunerActivity, l) + 2) / 5
+                max = 40
+                progress = (get() + 2) / 5
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { upd(p * 5) }
                     override fun onStartTrackingTouch(s: SeekBar) {}
-                    override fun onStopTrackingTouch(s: SeekBar) { HdrEngine.setLensPct(this@HdrTunerActivity, l, s.progress * 5); updateAuto() }
+                    override fun onStopTrackingTouch(s: SeekBar) { set(s.progress * 5); updateAuto() }
                 })
             }
-            val save = { HdrEngine.setLensPct(this, l, bar.progress * 5); updateAuto() }
-            lensBox.addView(stepperRow(bar, { bar.progress = (bar.progress - 1).coerceAtLeast(0) }, { bar.progress = (bar.progress + 1).coerceAtMost(30) }, save))
+            val save = { set(bar.progress * 5); updateAuto() }
+            target.addView(stepperRow(bar, { bar.progress = (bar.progress - 1).coerceAtLeast(0) }, { bar.progress = (bar.progress + 1).coerceAtMost(40) }, save))
         }
-        lensBox.visibility = if (HdrEngine.perLens(this)) View.VISIBLE else View.GONE
-        box.addView(sw("Nivel distinto por lente", HdrEngine.perLens(this)) { HdrEngine.setPerLens(this, it); lensBox.visibility = if (it) View.VISIBLE else View.GONE })
-        box.addView(note("Porcentaje del nivel elegido arriba (en pasos de luz). 100 % = igual; la frontal arranca en 60 %."))
-        box.addView(lensBox)
+        fun group(title: String, on: Boolean, setOn: (Boolean) -> Unit, help: String, fill: (LinearLayout) -> Unit) {
+            val inner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = if (on) View.VISIBLE else View.GONE }
+            fill(inner)
+            box.addView(sw(title, on) { setOn(it); inner.visibility = if (it) View.VISIBLE else View.GONE })
+            box.addView(note(help))
+            box.addView(inner)
+        }
+
+        group("Nivel según el zoom", HdrEngine.zoomOn(this), { HdrEngine.setZoomOn(this, it) },
+            "Con zoom digital (recorte) se usa este porcentaje del nivel, en pasos de luz. Ejemplo: x3 a 25x = recorte 8x → tramo 5x a 15x.") { g ->
+            for (b in HdrEngine.ZoomBand.values()) pctRow(g, b.label, { HdrEngine.zoomPct(this, b) }, { HdrEngine.setZoomPct(this, b, it) })
+        }
+
+        group("Nivel según la escena", HdrEngine.sceneOn(this), { HdrEngine.setScene(this, it) },
+            "Mira el brillo de la foto y usa este porcentaje del nivel. El nombre muestra el nivel final.") { g ->
+            for (k in HdrEngine.SceneKind.values()) pctRow(g, k.label, { HdrEngine.scenePct(this, k) }, { HdrEngine.setScenePct(this, k, it) })
+        }
+
+        group("Nivel distinto por lente", HdrEngine.perLens(this), { HdrEngine.setPerLens(this, it) },
+            "Porcentaje del nivel elegido arriba (en pasos de luz). 100 % = igual; la frontal arranca en 60 %.") { g ->
+            for (l in lensOrder) pctRow(g, l.label, { HdrEngine.lensPct(this, l) }, { HdrEngine.setLensPct(this, l, it) })
+        }
 
         android.app.AlertDialog.Builder(this)
             .setTitle("Ajustes")

@@ -26,9 +26,6 @@ object AutoHdr {
     private const val JOB_PERIODIC = 4932
     private const val PREFS = "cfg"
 
-    /** Agregar Ultra HDR a las fotos que llegan sin él (x3, x0.5, frontal). Prendido por defecto. */
-    fun addOn(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("autoAdd", true)
-    fun setAdd(ctx: Context, on: Boolean) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("autoAdd", on).apply()
 
     fun isOn(ctx: Context) = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("autoOn", false)
     fun level(ctx: Context) = HdrEngine.baseLevel(ctx)
@@ -99,7 +96,7 @@ object AutoHdr {
                         val f = File(path)
                         waitStable(f)
                         val src = f.readBytes()
-                        val r = HdrEngine.render(ctx, src, addOn(ctx) && rel.startsWith("DCIM/Camera"))
+                        val r = HdrEngine.render(ctx, src, rel.startsWith("DCIM/Camera"), lensRules = true)
                         var newPath: String? = null
                         if (r != null) {
                             if (r.kind != "igual") { writeBytes(f, src, r.bytes); changed++ }
