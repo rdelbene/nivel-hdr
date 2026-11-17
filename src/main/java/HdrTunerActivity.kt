@@ -268,7 +268,6 @@ class HdrTunerActivity : Activity() {
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7)
         else askBattery()
         updateAuto()
-        status.text = "Listo: cada foto nueva de la cámara se ajusta sola a ×%.2f.".format(target)
     }
 
     private var wantAuto = false
