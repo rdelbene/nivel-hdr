@@ -190,7 +190,7 @@ object HdrEngine {
         if (fx != null && fx.any) {
             val ex = try { ExifInterface(ByteArrayInputStream(primary)) } catch (_: Exception) { null }
             val orient = ex?.getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) ?: 1
-            val iso = ex?.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 0) ?: 0
+            val iso = ex?.getAttributeInt("ISOSpeedRatings", 0) ?: 0
             val gb = try { HdrFx.gainBitmap(small, lightsOnly, fx, orient, iso) } finally { small.recycle() }
             val bos = ByteArrayOutputStream()
             gb.compress(Bitmap.CompressFormat.JPEG, 92, bos); gb.recycle()

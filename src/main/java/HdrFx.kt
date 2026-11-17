@@ -74,8 +74,9 @@ object HdrFx {
                 val y = 0.2126f * cr + 0.7152f * cg + 0.0722f * cb
                 val s = 1f + SAT * l.coerceIn(0f, 1f)
                 fun ch(c: Float): Float {
-                    val ratio = ((y + s * (c - y)) / max(c, 1e-3f)).coerceIn(0.5f, 2f)
-                    return l + (ln(ratio.toDouble()) / ln(2.0)).toFloat() / M0.toFloat()
+                    val den: Float = if (c > 1e-3f) c else 1e-3f
+                    val ratio: Double = ((y + s * (c - y)) / den).toDouble().coerceIn(0.5, 2.0)
+                    return l + (ln(ratio) / ln(2.0) / M0).toFloat()
                 }
                 r[i] = ch(cr); g[i] = ch(cg); b[i] = ch(cb)
             } else { r[i] = l; g[i] = l; b[i] = l }
