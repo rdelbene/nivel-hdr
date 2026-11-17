@@ -87,16 +87,15 @@ object GainMapAdder {
 
     private fun fmt(v: Double) = String.format(java.util.Locale.US, "%.7f", v).trimEnd('0').trimEnd('.').ifEmpty { "0" }
 
-    private fun gainXmp(maxStops: Double, minStops: Double): ByteArray {
+    private fun gainXmp(maxStops: Double): ByteArray {
         val m = fmt(maxStops)
-        val mn = fmt(minStops)
         val cap = fmt(maxStops.coerceAtLeast(0.01))
         val x = """<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 5.5.0">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description rdf:about=""
         xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"
         hdrgm:Version="1.0"
-        hdrgm:GainMapMin="$mn"
+        hdrgm:GainMapMin="0"
         hdrgm:GainMapMax="$m"
         hdrgm:Gamma="1"
         hdrgm:OffsetSDR="0"
@@ -113,7 +112,7 @@ object GainMapAdder {
     /** Marca propia en el XMP principal: si el Ultra HDR lo agregó esta app y con qué estilo. */
     const val NS = "http://rdelbene.com/nivelhdr/1.0/"
 
-    private fun primaryXmp(gainLen: Int, added: Boolean, style: String, fx: String): ByteArray {
+    private fun primaryXmp(gainLen: Int, added: Boolean, style: String): ByteArray {
         val x = """<x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="Adobe XMP Core 5.1.2">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description
@@ -124,8 +123,7 @@ object GainMapAdder {
         hdrgm:Version="1.0"
         nivelhdr:Added="${if (added) "True" else "False"}"
         nivelhdr:Style="$style"
-        nivelhdr:Curve="$CURVE_VERSION"
-        nivelhdr:Fx="$fx">
+        nivelhdr:Curve="$CURVE_VERSION">
       <Container:Directory>
         <rdf:Seq>
           <rdf:li rdf:parseType="Resource">
@@ -147,12 +145,11 @@ object GainMapAdder {
         return XMP_NS + x.toByteArray(Charsets.UTF_8)
     }
 
-    private fun isoFull(maxStops: Double, minStops: Double): ByteArray {
+    private fun isoFull(maxStops: Double): ByteArray {
         val b = ISO_TEMPLATE.copyOf()
         fun put(p: Int, v: Long) { b[p] = (v shr 24).toByte(); b[p + 1] = (v shr 16).toByte(); b[p + 2] = (v shr 8).toByte(); b[p + 3] = v.toByte() }
         put(13, (maxStops.coerceAtLeast(0.01) * 4096).roundToLong()) // headroom alternativo (den 4096 en d+17)
         put(29, (maxStops * 4096).roundToLong())                   // gain_map_max (den 4096 en d+33)
-        put(21, (minStops * 0x10000000L).roundToLong())             // gain_map_min (con signo; den 2^28 en d+25)
         return ISO_TAG + b
     }
 
@@ -169,7 +166,7 @@ object GainMapAdder {
         return MPF_TAG + b
     }
 
-    class Marks(val added: Boolean, val style: String, val curve: Int, val fx: String)
+    class Marks(val added: Boolean, val style: String, val curve: Int)
 
     /**
      * Recorre los segmentos del encabezado (hasta SOS) leyendo solo lo necesario: [read] devuelve los bytes
@@ -203,8 +200,7 @@ object GainMapAdder {
                 val added = Regex("nivelhdr:Added=\"(\\w+)\"").find(s)?.groupValues?.get(1) == "True"
                 val style = Regex("nivelhdr:Style=\"(\\w+)\"").find(s)?.groupValues?.get(1) ?: "stock"
                 val curve = Regex("nivelhdr:Curve=\"(\\d+)\"").find(s)?.groupValues?.get(1)?.toIntOrNull() ?: 1
-                val fx = Regex("nivelhdr:Fx=\"([\\w+]*)\"").find(s)?.groupValues?.get(1) ?: ""
-                res = Marks(added, style, curve, fx); false
+                res = Marks(added, style, curve); false
             } else true
         }
         return res
@@ -309,8 +305,7 @@ object GainMapAdder {
      * Devuelve el archivo con Ultra HDR, o null si no conviene tocarlo (ya tiene gain map, es foto en movimiento,
      * o ya tiene varias imágenes adentro). [gainJpeg] es la JPEG chica del gain map (grises).
      */
-    fun build(primary: ByteArray, gainJpeg: ByteArray, maxStops: Double, added: Boolean = true, style: String = "stock",
-              fx: String = "", minStops: Double = 0.0): ByteArray? {
+    fun build(primary: ByteArray, gainJpeg: ByteArray, maxStops: Double, added: Boolean = true, style: String = "stock"): ByteArray? {
         if (primary.size < 4 || (primary[0].toInt() and 255) != 0xff || (primary[1].toInt() and 255) != 0xd8) return null
         // segmentos APPn del principio
         var i = 2
@@ -335,12 +330,12 @@ object GainMapAdder {
 
         // gain map: SOI + XMP + ISO + resto de la JPEG chica
         if ((gainJpeg[0].toInt() and 255) != 0xff || (gainJpeg[1].toInt() and 255) != 0xd8) return null
-        val gain = byteArrayOf(0xff.toByte(), 0xd8.toByte()) + segment(0xe1, gainXmp(maxS, minStops)) + segment(0xe2, isoFull(maxS, minStops)) +
+        val gain = byteArrayOf(0xff.toByte(), 0xd8.toByte()) + segment(0xe1, gainXmp(maxS)) + segment(0xe2, isoFull(maxS)) +
             gainJpeg.copyOfRange(2, gainJpeg.size)
 
         val head = if (dropFrom >= 0) primary.copyOfRange(0, dropFrom) + primary.copyOfRange(dropTo, insertAt) else primary.copyOfRange(0, insertAt)
         val tail = primary.copyOfRange(insertAt, primary.size)
-        val xmpSeg = segment(0xe1, primaryXmp(gain.size, added, style, fx))
+        val xmpSeg = segment(0xe1, primaryXmp(gain.size, added, style))
         val isoSeg = segment(0xe2, ISO_TAG + byteArrayOf(0, 0, 0, 0))
         val mpfLen = segment(0xe2, mpf(0, 0, 0)).size
         val primaryLen = head.size + xmpSeg.size + isoSeg.size + mpfLen + tail.size
