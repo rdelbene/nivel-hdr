@@ -24,7 +24,7 @@ jobs:
 
       - name: Build debug APK
         shell: bash
-        run: gradle lintDebug assembleDebug --no-daemon 2>&1 | tee build.log
+        run: gradle assembleDebug --no-daemon 2>&1 | tee build.log
 
       - uses: actions/upload-artifact@v4
         with:

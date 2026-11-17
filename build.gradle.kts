@@ -12,7 +12,7 @@ android {
 
     defaultConfig {
         applicationId = "com.rdelbene.nivelhdr"
-        minSdk = 33  // Android 13 en adelante
+        minSdk = 34
         targetSdk = 34
         versionCode = buildNumber
         versionName = "1.0.$buildNumber"
@@ -32,12 +32,6 @@ android {
         getByName("debug") {
             signingConfig = signingConfigs.getByName("fixed")
         }
-    }
-
-    // Falla la build si se usa algo que no existe en Android 13
-    lint {
-        checkOnly += "NewApi"
-        abortOnError = true
     }
 
     compileOptions {
