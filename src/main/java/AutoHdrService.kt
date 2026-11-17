@@ -78,7 +78,9 @@ class AutoHdrService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
-            startForeground(NOTIF_ID, notification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            if (android.os.Build.VERSION.SDK_INT >= 34)
+                startForeground(NOTIF_ID, notification(this), ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            else startForeground(NOTIF_ID, notification(this))
         } catch (_: Exception) {
             stopSelf(); return START_NOT_STICKY
         }
