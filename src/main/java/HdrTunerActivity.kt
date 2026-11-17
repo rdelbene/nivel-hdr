@@ -651,6 +651,7 @@ class HdrTunerActivity : Activity() {
             append("• Menú ⋮: Ajustes y Volver todo atrás.\n\n")
             append("Ajustes actuales:\n")
             append("• Estilo: " + (if (HdrEngine.style(c) == "luces") "solo las luces" else "como la stock") + "\n")
+            append("• Efectos: " + (HdrEngine.fxOpts(c).tag.replace("+", ", ").ifEmpty { "ninguno" }) + "\n")
             append("• Ultra HDR por lente: " + HdrEngine.Lens.values().joinToString(", ") { it.label + " " + (if (HdrEngine.lensOn(c, it)) "sí" else "no") } + "\n")
             append("• Nivel según el zoom: " + (if (HdrEngine.zoomOn(c)) HdrEngine.ZoomBand.values().joinToString(", ") { it.label.removePrefix("Recorte ") + " " + HdrEngine.zoomPct(c, it) + " %" } else "no") + "\n")
             append("• Nivel según la escena: " + (if (HdrEngine.sceneOn(c)) HdrEngine.SceneKind.values().joinToString(", ") { it.why + " " + HdrEngine.scenePct(c, it) + " %" } else "no") + "\n")
@@ -687,6 +688,16 @@ class HdrTunerActivity : Activity() {
 
         box.addView(sw("Estilo: solo las luces", HdrEngine.style(this) == "luces") { HdrEngine.setStyle(this, if (it) "luces" else "stock") })
         box.addView(note("Apagado: como la stock (ilumina casi toda la foto). Prendido: la foto queda normal y brillan solo cielo, lámparas y reflejos."))
+
+        // ---- efectos del HDR (solo cambian la capa de brillo, nunca la imagen)
+        box.addView(TextView(this).apply { text = "Efectos del HDR"; textSize = 16f; typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(6), 0, dp(2)) })
+        box.addView(sw("HDR a color", HdrEngine.fxColor(this)) { HdrEngine.setFx(this, "fxColor", it) })
+        box.addView(note("Atardeceres, luces cálidas y neones brillan con su color en vez de ir al blanco. Se ve en galerías con Ultra HDR de Android 14 o más."))
+        box.addView(sw("HDR por zonas", HdrEngine.fxZones(this)) { HdrEngine.setFx(this, "fxZones", it) })
+        box.addView(note("Más brillo en el cielo, menos en las caras y, con ISO alto (noche), menos en sombras y medios para que no resalte el grano. Si no detecta cielo o caras, queda como siempre."))
+        box.addView(sw("Contraste HDR", HdrEngine.fxContrast(this)) { HdrEngine.setFx(this, "fxContrast", it) })
+        box.addView(note("En HDR las sombras bajan un poco, para dar más profundidad. Proporcional al nivel: a ×1 no hace nada."))
+        box.addView(note("Prender o apagar un efecto rehace la capa de brillo (como el estilo): el archivo cambia un poco de tamaño. La imagen no se toca y se puede volver atrás."))
 
         // fila de porcentaje: etiqueta + − barra + (0 a 200 % de a 5 %)
         fun pctRow(target: LinearLayout, label: String, get: () -> Int, set: (Int) -> Unit) {

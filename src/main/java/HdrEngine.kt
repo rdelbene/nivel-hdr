@@ -61,6 +61,13 @@ object HdrEngine {
     fun sceneOn(ctx: Context) = p(ctx).getBoolean("scene", false)
     fun setScene(ctx: Context, on: Boolean) = p(ctx).edit().putBoolean("scene", on).apply()
     /** "stock" (ilumina casi toda la foto, como Motorola) o "luces" (solo cielo, lámparas, reflejos). */
+    /** Efectos del gain map (ver HdrFx). Apagados por defecto. */
+    fun fxColor(ctx: Context) = p(ctx).getBoolean("fxColor", false)
+    fun fxZones(ctx: Context) = p(ctx).getBoolean("fxZones", false)
+    fun fxContrast(ctx: Context) = p(ctx).getBoolean("fxContrast", false)
+    fun setFx(ctx: Context, key: String, on: Boolean) = p(ctx).edit().putBoolean(key, on).apply()
+    fun fxOpts(ctx: Context) = HdrFx.Opts(fxColor(ctx), fxZones(ctx), fxContrast(ctx))
+
     fun style(ctx: Context) = p(ctx).getString("style", "stock") ?: "stock"
     fun setStyle(ctx: Context, s: String) = p(ctx).edit().putString("style", s).apply()
 
@@ -178,8 +185,17 @@ object HdrEngine {
 
     class Result(val bytes: ByteArray, val boost: Double, val lens: Lens, val scene: String, val kind: String)
 
-    private fun gainJpeg(primary: ByteArray, lightsOnly: Boolean): ByteArray? {
+    private fun gainJpeg(primary: ByteArray, lightsOnly: Boolean, fx: HdrFx.Opts? = null): ByteArray? {
         val small = decodeSmall(primary, 4) ?: return null // gain map a 1/4, como la stock
+        if (fx != null && fx.any) {
+            val ex = try { ExifInterface(ByteArrayInputStream(primary)) } catch (_: Exception) { null }
+            val orient = ex?.getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) ?: 1
+            val iso = ex?.getAttributeInt(ExifInterface.TAG_PHOTOGRAPHIC_SENSITIVITY, 0) ?: 0
+            val gb = try { HdrFx.gainBitmap(small, lightsOnly, fx, orient, iso) } finally { small.recycle() }
+            val bos = ByteArrayOutputStream()
+            gb.compress(Bitmap.CompressFormat.JPEG, 92, bos); gb.recycle()
+            return bos.toByteArray()
+        }
         val w = small.width; val h = small.height
         val px = IntArray(w * h)
         small.getPixels(px, 0, w, 0, 0, w, h); small.recycle()
@@ -215,7 +231,11 @@ object HdrEngine {
         val stops = ln(plan.boost) / ln(2.0)
         // curva vieja de "solo las luces": se rehace con la nueva
         val oldCurve = marks != null && marks.style == "luces" && marks.curve < GainMapAdder.CURVE_VERSION
-        if (info != null && st == curStyle && !oldCurve) {
+        val fx = fxOpts(ctx)
+        val curFx = marks?.fx ?: ""
+        // con contraste, si la foto pasó por ×1 el mínimo quedó en 0: se rehace para recuperarlo
+        val lostContrast = fx.contrast && info != null && info.maxStops < 0.01 && stops > 0.01
+        if (info != null && st == curStyle && !oldCurve && fx.tag == curFx && !lostContrast) {
             // mismo estilo: solo cambia la intensidad, en el lugar
             if (kotlin.math.abs(info.maxBoost - plan.boost) < 0.02) return Result(src, plan.boost, plan.lens, plan.scene, "igual")
             val out = UltraHdrTuner.setMaxBoost(src, plan.boost) ?: return null
@@ -223,9 +243,10 @@ object HdrEngine {
         }
         val plain = if (info != null) GainMapAdder.strip(src) ?: return null else src
         if (info == null && !allowAdd) return null
-        val g = gainJpeg(plain, st == "luces") ?: return null
-        val out = GainMapAdder.build(plain, g, stops, added = !native, style = st) ?: return null
-        return Result(out, plan.boost, plan.lens, plan.scene, if (info == null) "agregada" else "estilo $st")
+        val g = gainJpeg(plain, st == "luces", fx) ?: return null
+        val minStops = if (fx.contrast) -HdrFx.CONTRAST_K * stops else 0.0
+        val out = GainMapAdder.build(plain, g, stops, added = !native, style = st, fx = fx.tag, minStops = minStops) ?: return null
+        return Result(out, plan.boost, plan.lens, plan.scene, if (info == null) "agregada" else if (fx.tag != curFx) "efectos" else "estilo $st")
     }
 
     /**
