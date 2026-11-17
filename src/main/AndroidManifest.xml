@@ -34,6 +34,11 @@
                 <data android:mimeType="image/jpeg" />
             </intent-filter>
         </activity>
+        <activity
+            android:name=".PreviewActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:theme="@android:style/Theme.Material.NoActionBar.Fullscreen" />
         <service
             android:name=".AutoHdrJob"
             android:exported="false"

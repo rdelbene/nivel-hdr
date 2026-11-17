@@ -41,6 +41,16 @@ class HdrTunerActivity : Activity() {
     private val STOCK_BOOST = 4.93
     private val REQ_PERM = 10
     private val REQ_WRITE = 11
+    private val REQ_PREVIEW = 12
+    private val REQ_IMPORT = 13
+    private var pendingLevel = 2.5
+
+    // filtros de la grilla
+    private var lensFilter: String? = null      // null = todas; si no, la etiqueta del lente ("0.5x", "1x", "3x", "frontal")
+    private var dateFilter = 0                  // 0 todas, 1 hoy, 2 últimos 7 días, 3 últimos 30 días, 4 este año
+    private val dates = java.util.concurrent.ConcurrentHashMap<Uri, Long>()
+    private lateinit var selBar: LinearLayout
+    private lateinit var selText: TextView
 
     private val io = Executors.newFixedThreadPool(3)
     private val main = Handler(Looper.getMainLooper())
@@ -184,7 +194,7 @@ class HdrTunerActivity : Activity() {
         filterBtn = TextView(this).apply {
             textSize = 13f; setTextColor(Color.WHITE); setPadding(dp(12), dp(6), dp(12), dp(6))
             background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(255, 50, 50, 50)) }
-            setOnClickListener { onlyPending = !onlyPending; applyFilter() }
+            setOnClickListener { showFilters() }
         }
         root.addView(filterBtn, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(6) })
 
@@ -195,11 +205,35 @@ class HdrTunerActivity : Activity() {
             adapter = this@HdrTunerActivity.adapter
             setOnItemClickListener { _, _, pos, _ ->
                 val u = items[pos]
+                if (selected.isEmpty() && !sharedMode) { openPreview(u); return@setOnItemClickListener }
                 if (!selected.remove(u)) selected += u
                 this@HdrTunerActivity.adapter.notifyDataSetChanged()
                 updateButtons()
             }
+            setOnItemLongClickListener { _, _, pos, _ ->
+                val u = items[pos]
+                if (!selected.remove(u)) selected += u
+                this@HdrTunerActivity.adapter.notifyDataSetChanged()
+                updateButtons()
+                true
+            }
         }
+        // barra de selección (aparece al elegir con toque largo)
+        selBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; visibility = View.GONE
+            setPadding(0, 0, 0, dp(6))
+        }
+        selText = TextView(this).apply { textSize = 14f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD }
+        selBar.addView(selText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        fun chip(t: String, act: () -> Unit) = TextView(this).apply {
+            text = t; textSize = 13f; setTextColor(Color.WHITE); setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.argb(255, 50, 50, 50)) }
+            setOnClickListener { act() }
+        }
+        selBar.addView(chip("Todas las que se ven") { selected += items; adapter.notifyDataSetChanged(); updateButtons() },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { rightMargin = dp(6) })
+        selBar.addView(chip("✕") { selected.clear(); adapter.notifyDataSetChanged(); updateButtons() })
+        root.addView(selBar)
         root.addView(grid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(10), 0, 0) }
@@ -354,6 +388,10 @@ class HdrTunerActivity : Activity() {
 
     private fun updateButtons() {
         val n = selected.size
+        if (::selBar.isInitialized) {
+            selBar.visibility = if (n > 0 && !sharedMode) View.VISIBLE else View.GONE
+            selText.text = "$n elegida" + (if (n == 1) "" else "s") + " · tocá para sumar o sacar"
+        }
         btnCopy.alpha = if (n > 0) 1f else 0.4f
         btnReplace.alpha = if (n > 0) 1f else 0.4f
         btnReplace.text = if (n > 0) "Reemplazar ($n)" else "Reemplazar"
@@ -448,7 +486,7 @@ class HdrTunerActivity : Activity() {
             try {
                 contentResolver.query(
                     MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
+                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.Images.Media.DATE_TAKEN, MediaStore.MediaColumns.DATE_ADDED),
                     "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ? AND ${MediaStore.MediaColumns.MIME_TYPE} = ?",
                     arrayOf("DCIM/Camera%", "image/jpeg"),
                     "${MediaStore.MediaColumns.DATE_ADDED} DESC"
@@ -457,6 +495,7 @@ class HdrTunerActivity : Activity() {
                     while (c.moveToNext()) {
                         val u = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, c.getLong(0))
                         list += u; nm[u] = c.getString(1) ?: ""
+                        dates[u] = if (!c.isNull(2) && c.getLong(2) > 0) c.getLong(2) else c.getLong(3) * 1000
                     }
                 }
             } catch (e: Exception) {
@@ -487,7 +526,10 @@ class HdrTunerActivity : Activity() {
             } catch (_: Exception) {}
             metas[u] = Meta(lv, lens, zoom, crop)
             main.post {
-                if (!refreshPosted) { refreshPosted = true; main.postDelayed({ refreshPosted = false; adapter.notifyDataSetChanged() }, 250) }
+                if (!refreshPosted) { refreshPosted = true; main.postDelayed({
+                    refreshPosted = false
+                    if (lensFilter != null) applyFilter() else adapter.notifyDataSetChanged()
+                }, 250) }
             }
         }
     }
@@ -510,7 +552,7 @@ class HdrTunerActivity : Activity() {
             // Android pide confirmación para modificar fotos de otra app
             try {
                 val pi = MediaStore.createWriteRequest(contentResolver, list)
-                pendingReplace = list
+                pendingReplace = list; pendingLevel = target
                 startIntentSenderForResult(pi.intentSender, REQ_WRITE, null, 0, 0, 0)
             } catch (e: Exception) {
                 status.text = "No se pudo pedir permiso para reemplazar: ${e.message}"
@@ -524,13 +566,26 @@ class HdrTunerActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_WRITE) {
-            if (resultCode == RESULT_OK) process(pendingReplace, true)
+            if (resultCode == RESULT_OK) process(pendingReplace, true, pendingLevel)
             else status.text = "No se reemplazó nada (permiso cancelado)."
         }
+        if (requestCode == REQ_PREVIEW && resultCode == RESULT_OK && data != null) {
+            val u = data.getParcelableExtra(PreviewActivity.EXTRA_URI, Uri::class.java) ?: return
+            val lv = data.getDoubleExtra(PreviewActivity.EXTRA_LEVEL, target)
+            if (data.getBooleanExtra(PreviewActivity.EXTRA_REPLACE, false)) {
+                try {
+                    val pi = MediaStore.createWriteRequest(contentResolver, listOf(u))
+                    pendingReplace = listOf(u); pendingLevel = lv
+                    @Suppress("DEPRECATION")
+                    startIntentSenderForResult(pi.intentSender, REQ_WRITE, null, 0, 0, 0)
+                } catch (e: Exception) { status.text = "No se pudo pedir permiso para reemplazar: ${e.message}" }
+            } else process(listOf(u), false, lv)
+        }
+        if (requestCode == REQ_IMPORT && resultCode == RESULT_OK) data?.data?.let { applyImported(it) }
     }
 
-    private fun process(list: List<Uri>, replace: Boolean) {
-        val t = target
+    private fun process(list: List<Uri>, replace: Boolean, level: Double = target) {
+        val t = level
         status.text = "Procesando ${list.size} foto(s)..."
         io.execute {
             var ok = 0; var noHdr = 0; var fail = 0; var added = 0
@@ -603,12 +658,149 @@ class HdrTunerActivity : Activity() {
 
     // ------------------------------------------------------------------ grilla: nivel y filtro
 
+    private fun dateFrom(): Long {
+        val c = java.util.Calendar.getInstance()
+        c.set(java.util.Calendar.HOUR_OF_DAY, 0); c.set(java.util.Calendar.MINUTE, 0); c.set(java.util.Calendar.SECOND, 0); c.set(java.util.Calendar.MILLISECOND, 0)
+        when (dateFilter) {
+            1 -> {}
+            2 -> c.add(java.util.Calendar.DAY_OF_YEAR, -6)
+            3 -> c.add(java.util.Calendar.DAY_OF_YEAR, -29)
+            4 -> c.set(java.util.Calendar.DAY_OF_YEAR, 1)
+            else -> return 0L
+        }
+        return c.timeInMillis
+    }
+
+    private val DATE_NAMES = arrayOf("todas las fechas", "hoy", "últimos 7 días", "últimos 30 días", "este año")
+
     private fun applyFilter() {
-        items.clear()
-        items += if (onlyPending) allItems.filter { isPending(it) } else allItems
-        val pend = allItems.count { isPending(it) }
-        filterBtn.text = if (onlyPending) "Viendo: sin ajustar ($pend) ▾" else "Viendo: todas (${allItems.size}) ▾"
+        val from = dateFrom()
+        val base = allItems.filter { u ->
+            (!onlyPending || isPending(u)) && (from == 0L || (dates[u] ?: 0L) >= from)
+        }
+        val lf = lensFilter
+        var reading = 0
+        val list = if (lf == null) base else base.filter { u ->
+            val m = metas[u]
+            if (m == null) { reading++; loadMeta(u); false } else m.lens == lf
+        }
+        val sel = items.toSet()
+        items.clear(); items += list
+        // lo elegido que ya no se ve, se suelta
+        if (sel != items.toSet()) selected.retainAll(items.toSet())
+        val parts = mutableListOf(if (onlyPending) "sin ajustar" else "todas")
+        lf?.let { parts += it }
+        if (dateFilter != 0) parts += DATE_NAMES[dateFilter]
+        filterBtn.text = "Viendo: " + parts.joinToString(" · ") + " (${items.size})" + (if (reading > 0) " · leyendo $reading…" else "") + " ▾"
         adapter.notifyDataSetChanged()
+        updateButtons()
+    }
+
+    /** Filtros de la grilla: estado, lente y fecha. */
+    private fun showFilters() {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+        fun title(t: String) = TextView(this).apply { text = t; textSize = 15f; typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(10), 0, dp(4)) }
+        fun group(options: List<String>, sel: Int, onPick: (Int) -> Unit) = android.widget.RadioGroup(this).apply {
+            options.forEachIndexed { i, o -> addView(android.widget.RadioButton(context).apply { text = o; id = 1000 + i; isChecked = i == sel }) }
+            setOnCheckedChangeListener { _, id -> onPick(id - 1000) }
+        }
+        box.addView(title("Fotos"))
+        box.addView(group(listOf("Todas", "Solo sin ajustar"), if (onlyPending) 1 else 0) { onlyPending = it == 1 })
+        val lenses = listOf(null, "0.5x", "1x", "3x", "frontal")
+        box.addView(title("Lente"))
+        box.addView(group(listOf("Todos", "0.5x", "1x", "3x", "Frontal"), lenses.indexOf(lensFilter).coerceAtLeast(0)) { lensFilter = lenses[it] })
+        box.addView(title("Fecha"))
+        box.addView(group(listOf("Todas", "Hoy", "Últimos 7 días", "Últimos 30 días", "Este año"), dateFilter) { dateFilter = it })
+        box.addView(TextView(this).apply {
+            textSize = 12f; setTextColor(Color.GRAY); setPadding(0, dp(8), 0, 0)
+            text = "Para filtrar por lente se lee cada foto: con muchas fotos tarda unos segundos en completarse."
+        })
+        android.app.AlertDialog.Builder(this).setTitle("Filtrar")
+            .setView(android.widget.ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Listo") { _, _ -> applyFilter() }
+            .setNeutralButton("Quitar filtros") { _, _ -> onlyPending = false; lensFilter = null; dateFilter = 0; applyFilter() }
+            .show()
+    }
+
+    // ------------------------------------------------------------------ vista previa
+
+    private fun openPreview(u: Uri) {
+        @Suppress("DEPRECATION")
+        startActivityForResult(Intent(this, PreviewActivity::class.java)
+            .putExtra(PreviewActivity.EXTRA_URI, u).putExtra(PreviewActivity.EXTRA_LEVEL, target), REQ_PREVIEW)
+    }
+
+    // ------------------------------------------------------------------ guardar y restaurar ajustes
+
+    private val NOT_SETTINGS = setOf("autoCount", "autoLastId")
+
+    private fun exportSettings() {
+        val o = org.json.JSONObject()
+        for ((k, v) in getSharedPreferences("cfg", Context.MODE_PRIVATE).all) {
+            if (k in NOT_SETTINGS || v == null) continue
+            o.put(k, org.json.JSONObject().apply {
+                when (v) {
+                    is Boolean -> { put("t", "b"); put("v", v) }
+                    is Int -> { put("t", "i"); put("v", v) }
+                    is Long -> { put("t", "l"); put("v", v) }
+                    is Float -> { put("t", "f"); put("v", v.toDouble()) }
+                    is String -> { put("t", "s"); put("v", v) }
+                    else -> return@apply
+                }
+            })
+        }
+        val json = org.json.JSONObject().put("app", "nivelhdr").put("version", 1).put("ajustes", o).toString(2)
+        try {
+            val v = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "NivelHDR-ajustes.json")
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download")
+            }
+            val u = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v) ?: throw IllegalStateException()
+            contentResolver.openOutputStream(u)?.use { it.write(json.toByteArray()) }
+            status.text = "Ajustes guardados en Descargas (NivelHDR-ajustes.json). Copialo al otro celular y usá \"Restaurar ajustes\"."
+        } catch (e: Exception) {
+            status.text = "No pude guardar los ajustes: ${e.message}"
+        }
+    }
+
+    private fun importSettings() {
+        @Suppress("DEPRECATION")
+        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"
+        }, REQ_IMPORT)
+    }
+
+    private fun applyImported(u: Uri) {
+        try {
+            val txt = contentResolver.openInputStream(u)?.use { it.readBytes().toString(Charsets.UTF_8) } ?: throw IllegalStateException()
+            val root = org.json.JSONObject(txt)
+            if (root.optString("app") != "nivelhdr") throw IllegalArgumentException("no es un archivo de ajustes de Nivel HDR")
+            val o = root.getJSONObject("ajustes")
+            val e = getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
+            var n = 0
+            for (k in o.keys()) {
+                if (k in NOT_SETTINGS) continue
+                val it = o.getJSONObject(k)
+                when (it.getString("t")) {
+                    "b" -> e.putBoolean(k, it.getBoolean("v"))
+                    "i" -> e.putInt(k, it.getInt("v"))
+                    "l" -> e.putLong(k, it.getLong("v"))
+                    "f" -> e.putFloat(k, it.getDouble("v").toFloat())
+                    "s" -> e.putString(k, it.getString("v"))
+                    else -> continue
+                }
+                n++
+            }
+            e.commit()
+            target = LEVELS[levelIndex(getSharedPreferences("cfg", Context.MODE_PRIVATE).getFloat("tuneBoost", 2.5f).toDouble())]
+            setLevel(levelIndex(target), false)
+            AutoHdrService.refresh(this)
+            updateAuto()
+            status.text = "Ajustes restaurados ($n)." + if (AutoHdr.isOn(this) && !AutoHdr.canWrite()) " Falta darle \"Acceso a todos los archivos\" para el automático." else ""
+        } catch (ex: Exception) {
+            status.text = "No pude restaurar los ajustes: ${ex.message}"
+        }
     }
 
     /** Nivel actual leyendo solo los encabezados y el comienzo del gain map (rápido aunque la foto pese mucho). */
@@ -633,8 +825,10 @@ class HdrTunerActivity : Activity() {
     private fun showMenu(anchor: View) {
         val pm = android.widget.PopupMenu(this, anchor)
         pm.menu.add(0, 1, 0, "Ajustes")
-        pm.menu.add(0, 2, 1, "Volver todo atrás")
-        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert() }; true }
+        pm.menu.add(0, 3, 1, "Guardar ajustes")
+        pm.menu.add(0, 4, 2, "Restaurar ajustes")
+        pm.menu.add(0, 2, 3, "Volver todo atrás")
+        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert(); 3 -> exportSettings(); 4 -> importSettings() }; true }
         pm.show()
     }
 
@@ -646,9 +840,10 @@ class HdrTunerActivity : Activity() {
             append("• Automático: cada foto nueva de la cámara se ajusta sola a los pocos segundos. Queda corriendo con una notificación fija.\n\n")
             append("• Panel de notificaciones: el botón \"Nivel HDR\" cambia el nivel sin abrir la app.\n\n")
             append("• Nombre: cada foto ajustada termina en _HDRx2.5 (el nivel final que quedó).\n\n")
-            append("• Grilla: lente · zoom · nivel, por ejemplo \"0.5x · zoom 1.8 · HDR 2.4\". El zoom aparece solo si la cámara recortó. En naranja, las que todavía no ajustó la app. Arriba de la grilla podés ver todas o solo las sin ajustar.\n\n")
-            append("• Para ajustar fotos a mano: tocalas y usá \"Guardar copia\" o \"Reemplazar\".\n\n")
-            append("• Menú ⋮: Ajustes y Volver todo atrás.\n\n")
+            append("• Grilla: lente · zoom · nivel, por ejemplo \"0.5x · zoom 1.8 · HDR 2.4\". El zoom aparece solo si la cámara recortó. En naranja, las que todavía no ajustó la app. Con \"Viendo\" filtrás por estado, lente y fecha.\n\n")
+            append("• Vista previa: tocá una foto para verla en pantalla completa con el Ultra HDR real, probar el nivel con la barra y ver el detalle (por qué queda ese nivel: lente, zoom, escena). Mantené apretada la foto para ver cómo está ahora. Recién se guarda con \"Guardar copia\" o \"Reemplazar\".\n\n")
+            append("• Varias fotos a la vez: mantené apretada una foto para empezar a elegir, tocá las demás (o \"Todas las que se ven\") y usá \"Guardar copia\" o \"Reemplazar\" de abajo.\n\n")
+            append("• Menú ⋮: Ajustes, Guardar ajustes y Restaurar ajustes (archivo en Descargas, para otro celular o al reinstalar) y Volver todo atrás.\n\n")
             append("Ajustes actuales:\n")
             append("• Estilo: " + (if (HdrEngine.style(c) == "luces") "solo las luces" else "como la stock") + "\n")
             append("• Ultra HDR por lente: " + HdrEngine.Lens.values().joinToString(", ") { it.label + " " + (if (HdrEngine.lensOn(c, it)) "sí" else "no") } + "\n")

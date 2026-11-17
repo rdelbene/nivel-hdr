@@ -147,36 +147,51 @@ object HdrEngine {
 
     // ------------------------------------------------------------------ nivel
 
-    class Plan(val boost: Double, val lens: Lens, val scene: String)
+    /** [steps]: explicación paso a paso de cómo se llegó al nivel (para "Detalle de la foto"). */
+    class Plan(val boost: Double, val lens: Lens, val scene: String, val steps: List<String> = emptyList())
 
     fun levelFor(ctx: Context, src: ByteArray, nativeUhdr: Boolean, baseOverride: Double? = null): Plan {
         val base = baseOverride ?: baseLevel(ctx)
         var stops = ln(base.coerceAtLeast(1.0)) / ln(2.0)
+        val steps = mutableListOf<String>()
+        steps += "Nivel elegido: ×%.1f (%.2f pasos de luz)".format(base, stops)
         val ex = try { ExifInterface(ByteArrayInputStream(src)) } catch (_: Exception) { null }
         val lens = if (nativeUhdr || ex == null) Lens.MAIN else lensOf(ex)
-        if (perLens(ctx)) stops *= lensPct(ctx, lens) / 100.0
-        var why = ""
-        if (zoomOn(ctx) && ex != null) {
-            val z = zoomOf(ex)
-            if (z != null) {
-                val pct = zoomPct(ctx, zoomBand(z.crop))
-                if (pct != 100) { stops *= pct / 100.0; why = "zoom %.0fx".format(z.total) }
-            }
+        val zz = ex?.let { zoomOf(it) }
+        steps += "Lente: ${lens.label}" + (if (nativeUhdr) " (trae Ultra HDR de la cámara)" else " (sin Ultra HDR de la cámara: se le agrega)")
+        if (perLens(ctx)) {
+            val pct = lensPct(ctx, lens)
+            stops *= pct / 100.0
+            steps += "Nivel por lente ${lens.label}: $pct %"
         }
+        var why = ""
+        if (zoomOn(ctx) && zz != null) {
+            val b = zoomBand(zz.crop)
+            val pct = zoomPct(ctx, b)
+            if (pct != 100) { stops *= pct / 100.0; why = "zoom %.0fx".format(zz.total) }
+            steps += "Zoom %.1fx, recorte %.1fx (%s): %d %%".format(zz.total, zz.crop, b.label.removePrefix("Recorte ").lowercase(), pct)
+        } else if (zz != null && zz.crop > 1.05) steps += "Zoom %.1fx (recorte %.1fx): no se tiene en cuenta (apagado)".format(zz.total, zz.crop)
         if (sceneOn(ctx) && stops > 0.0) {
             val k = scene(src).kind
             if (k != null) {
-                stops *= scenePct(ctx, k) / 100.0
+                val pct = scenePct(ctx, k)
+                stops *= pct / 100.0
                 if (k != SceneKind.NORMAL) why = if (why.isEmpty()) k.why else "$why, ${k.why}"
+                steps += "Escena ${k.why}: $pct %"
             }
         }
+        if (stops > STOCK_STOPS) steps += "Tope: no pasa de ×4.93 (como la stock)"
         stops = stops.coerceIn(0.0, STOCK_STOPS)
-        return Plan(2.0.pow(stops), lens, why)
+        steps += "Estilo: " + (if (style(ctx) == "luces") "solo las luces" else "como la stock")
+        steps += "Nivel final: ×%.2f (%.2f pasos)".format(2.0.pow(stops), stops)
+        if (!lensOn(ctx, lens)) steps += "Ojo: el automático tiene el Ultra HDR apagado en ${lens.label}; esto vale si la ajustás a mano."
+        return Plan(2.0.pow(stops), lens, why, steps)
     }
 
     // ------------------------------------------------------------------ armado
 
-    class Result(val bytes: ByteArray, val boost: Double, val lens: Lens, val scene: String, val kind: String)
+    class Result(val bytes: ByteArray, val boost: Double, val lens: Lens, val scene: String, val kind: String,
+                 val steps: List<String> = emptyList())
 
     private fun gainJpeg(primary: ByteArray, lightsOnly: Boolean): ByteArray? {
         val small = decodeSmall(primary, 4) ?: return null // gain map a 1/4, como la stock
@@ -217,15 +232,15 @@ object HdrEngine {
         val oldCurve = marks != null && marks.style == "luces" && marks.curve < GainMapAdder.CURVE_VERSION
         if (info != null && st == curStyle && !oldCurve) {
             // mismo estilo: solo cambia la intensidad, en el lugar
-            if (kotlin.math.abs(info.maxBoost - plan.boost) < 0.02) return Result(src, plan.boost, plan.lens, plan.scene, "igual")
+            if (kotlin.math.abs(info.maxBoost - plan.boost) < 0.02) return Result(src, plan.boost, plan.lens, plan.scene, "igual", plan.steps)
             val out = UltraHdrTuner.setMaxBoost(src, plan.boost) ?: return null
-            return Result(out, plan.boost, plan.lens, plan.scene, "ajustada")
+            return Result(out, plan.boost, plan.lens, plan.scene, "ajustada", plan.steps)
         }
         val plain = if (info != null) GainMapAdder.strip(src) ?: return null else src
         if (info == null && !allowAdd) return null
         val g = gainJpeg(plain, st == "luces") ?: return null
         val out = GainMapAdder.build(plain, g, stops, added = !native, style = st) ?: return null
-        return Result(out, plan.boost, plan.lens, plan.scene, if (info == null) "agregada" else "estilo $st")
+        return Result(out, plan.boost, plan.lens, plan.scene, if (info == null) "agregada" else "estilo $st", plan.steps)
     }
 
     /**
