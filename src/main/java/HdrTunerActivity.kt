@@ -275,6 +275,7 @@ class HdrTunerActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        listenBatch()
         if (wantAuto && AutoHdr.canWrite()) { wantAuto = false; toggleAuto() }
         // automático ya prendido (de una versión anterior) sin "sin restricciones": se pide una vez por apertura
         if (!askedBattery && AutoHdr.isOn(this) && AutoHdr.canWrite() &&
@@ -824,10 +825,11 @@ class HdrTunerActivity : Activity() {
     private fun showMenu(anchor: View) {
         val pm = android.widget.PopupMenu(this, anchor)
         pm.menu.add(0, 1, 0, "Ajustes")
+        pm.menu.add(0, 5, 1, if (BatchService.running) "Ajustando la galería…" else "Ajustar toda la galería")
         pm.menu.add(0, 3, 1, "Guardar ajustes")
         pm.menu.add(0, 4, 2, "Restaurar ajustes")
         pm.menu.add(0, 2, 3, "Volver todo atrás")
-        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert(); 3 -> exportSettings(); 4 -> importSettings() }; true }
+        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert(); 3 -> exportSettings(); 4 -> importSettings(); 5 -> confirmBatch() }; true }
         pm.show()
     }
 
@@ -931,6 +933,49 @@ class HdrTunerActivity : Activity() {
     }
 
     // ------------------------------------------------------------------ volver todo atrás
+
+    // ------------------------------------------------------------------ ajustar toda la galería
+
+    private fun confirmBatch() {
+        if (BatchService.running) { status.text = "Ya se está ajustando la galería. El avance está en la notificación (ahí también podés detenerlo)."; return }
+        if (!AutoHdr.canWrite()) {
+            status.text = "Para esto hace falta \"Acceso a todos los archivos\". Activalo y volvé a tocar \"Ajustar toda la galería\"."
+            try { startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))) } catch (_: Exception) {}
+            return
+        }
+        io.execute {
+            val n = AutoHdr.allPhotos(this).size
+            main.post {
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("¿Ajustar toda la galería?")
+                    .setMessage("Se van a revisar las $n fotos de la cámara (DCIM) y a cada una se le pone el nivel que calcula la app con tus ajustes actuales: " +
+                        "nivel ×%.1f, Ultra HDR por lente, nivel por lente, zoom, escena y estilo. Es lo mismo que haría el automático si la sacaras ahora.\n\n".format(target) +
+                        "Se modifican las fotos originales (no son copias) y se agrega el nivel al nombre. Se puede deshacer con \"Volver todo atrás\".\n\n" +
+                        "Puede tardar varios minutos. Sigue aunque cierres la app, y te aviso con una notificación cuando termine.")
+                    .setNegativeButton("Cancelar", null)
+                    .setPositiveButton("Ajustar todas") { _, _ ->
+                        try { BatchService.start(this); status.text = "Ajustando toda la galería…" }
+                        catch (e: Exception) { status.text = "No se pudo empezar: ${e.message}" }
+                    }
+                    .show()
+            }
+        }
+    }
+
+    private fun listenBatch() {
+        BatchService.listener = { text, done ->
+            main.post {
+                if (::status.isInitialized) status.text = text
+                if (done) {
+                    loadRecent()
+                    android.app.AlertDialog.Builder(this).setTitle("Galería ajustada").setMessage(text).setPositiveButton("OK", null).show()
+                }
+            }
+        }
+        if (BatchService.running && ::status.isInitialized) status.text = "Ajustando toda la galería… (el avance está en la notificación)"
+    }
+
+    override fun onPause() { BatchService.listener = null; super.onPause() }
 
     private fun confirmRevert() {
         android.app.AlertDialog.Builder(this)

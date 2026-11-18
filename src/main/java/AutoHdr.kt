@@ -95,14 +95,9 @@ object AutoHdr {
                     try {
                         val f = File(path)
                         waitStable(f)
-                        val src = f.readBytes()
-                        val r = HdrEngine.render(ctx, src, rel.startsWith("DCIM/Camera"), lensRules = true)
-                        var newPath: String? = null
-                        if (r != null) {
-                            if (r.kind != "igual") { writeBytes(f, src, r.bytes); changed++ }
-                            newPath = renameWithLevel(ctx, id, f, r.boost) // el nivel queda en el nombre
-                        }
-                        paths += newPath ?: path
+                        val (res, p) = processOne(ctx, id, f, rel)
+                        if (res == ONE_CHANGED) changed++
+                        paths += p
                     } catch (_: Exception) {}
                 }
                 lastId = id
@@ -117,6 +112,63 @@ object AutoHdr {
     private val SUFFIX = Regex("_HDRx\\d+(\\.\\d+)?$")
 
     /** Nombre con el nivel al final: IMG_20261112_0941.jpg -> IMG_20261112_0941_HDRx2.5.jpg (reemplaza uno viejo). */
+    const val ONE_CHANGED = 1
+    const val ONE_SAME = 2
+    const val ONE_SKIPPED = 3
+
+    /**
+     * Ajusta una foto con el nivel calculado según los ajustes (lente, zoom, escena, Ultra HDR por lente…),
+     * igual que el automático. Devuelve el resultado y la ruta final (cambia si se le agrega el nivel al nombre).
+     */
+    fun processOne(ctx: Context, id: Long, f: File, rel: String): Pair<Int, String> {
+        val src = f.readBytes()
+        val r = HdrEngine.render(ctx, src, rel.startsWith("DCIM/Camera"), lensRules = true) ?: return ONE_SKIPPED to f.path
+        var res = ONE_SAME
+        if (r.kind != "igual") { writeBytes(f, src, r.bytes); res = ONE_CHANGED }
+        val newPath = renameWithLevel(ctx, id, f, r.boost) // el nivel queda en el nombre
+        return res to (newPath ?: f.path)
+    }
+
+    class BatchStats(var total: Int = 0, var changed: Int = 0, var same: Int = 0, var skipped: Int = 0, var errors: Int = 0)
+
+    /** Todas las fotos JPEG de DCIM/ (menos las copias de esta app), de la más nueva a la más vieja. */
+    fun allPhotos(ctx: Context): List<Triple<Long, String, String>> {
+        val list = mutableListOf<Triple<Long, String, String>>()
+        ctx.contentResolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Images.Media._ID, MediaStore.Images.Media.DATA, MediaStore.Images.Media.RELATIVE_PATH,
+                MediaStore.Images.Media.OWNER_PACKAGE_NAME, MediaStore.Images.Media.IS_PENDING),
+            "${MediaStore.Images.Media.MIME_TYPE} = ? AND ${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?",
+            arrayOf("image/jpeg", "DCIM/%"), "${MediaStore.Images.Media._ID} DESC")?.use { c ->
+            while (c.moveToNext()) {
+                if (c.getString(3) == ctx.packageName || c.getInt(4) != 0) continue
+                val path = c.getString(1) ?: continue
+                list += Triple(c.getLong(0), path, c.getString(2) ?: "")
+            }
+        }
+        return list
+    }
+
+    /** Recorre toda la galería y aplica el nivel calculado a cada foto. */
+    fun processAll(ctx: Context, cancelled: () -> Boolean, progress: (Int, Int, BatchStats) -> Unit): BatchStats {
+        val list = allPhotos(ctx)
+        val st = BatchStats(total = list.size)
+        val paths = mutableListOf<String>()
+        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        for ((k, e) in list.withIndex()) {
+            if (cancelled()) break
+            progress(k + 1, list.size, st)
+            try {
+                val (res, p) = processOne(ctx, e.first, File(e.second), e.third)
+                when (res) { ONE_CHANGED -> st.changed++; ONE_SAME -> st.same++; else -> st.skipped++ }
+                paths += p
+            } catch (_: Throwable) { st.errors++ }
+            if (paths.size >= 50) { MediaScannerConnection.scanFile(ctx, paths.toTypedArray(), null, null); paths.clear() }
+        }
+        if (paths.isNotEmpty()) MediaScannerConnection.scanFile(ctx, paths.toTypedArray(), null, null)
+        if (st.changed > 0) prefs.edit().putInt("autoCount", prefs.getInt("autoCount", 0) + st.changed).apply()
+        return st
+    }
+
     fun nameWithLevel(name: String, boost: Double): String {
         val dot = name.lastIndexOf('.')
         val base = if (dot > 0) name.substring(0, dot) else name

@@ -54,6 +54,14 @@
             </intent-filter>
         </service>
         <service
+            android:name=".BatchService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Ajusta el nivel de Ultra HDR de todas las fotos de la galería cuando el usuario lo pide" />
+        </service>
+        <service
             android:name=".AutoHdrService"
             android:exported="false"
             android:foregroundServiceType="specialUse">
