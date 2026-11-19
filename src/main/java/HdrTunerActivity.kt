@@ -91,6 +91,7 @@ class HdrTunerActivity : Activity() {
         val prefs = getSharedPreferences("cfg", Context.MODE_PRIVATE)
         target = LEVELS[levelIndex(prefs.getFloat("tuneBoost", 2.5f).toDouble())]
         buildUi()
+        io.execute { try { Papelera.cleanup(this) } catch (_: Throwable) {} } // borra lo vencido de la Papelera
 
         // ¿Vino desde "Compartir" en la galería?
         val shared = sharedUris(intent)
@@ -602,11 +603,15 @@ class HdrTunerActivity : Activity() {
                     lastBoost = r.boost
                     val out = r.bytes
                     if (replace) {
+                        val name = try {
+                            contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
+                                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                        } catch (_: Exception) { null }
+                        // antes de tocar el original, lo necesario para dejarlo como estaba (Papelera)
+                        if (r.kind != "igual") Papelera.record(this, Papelera.keyOf(u), src, out, name ?: "", u.toString())
                         contentResolver.openOutputStream(u, "wt")?.use { it.write(out) } ?: throw IllegalStateException("no se pudo escribir")
                         // el nivel también queda en el nombre de la foto
                         try {
-                            val name = contentResolver.query(u, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
-                                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
                             if (name != null) {
                                 val nn = AutoHdr.nameWithLevel(name, lastBoost)
                                 if (nn != name) contentResolver.update(u, ContentValues().apply { put(MediaStore.MediaColumns.DISPLAY_NAME, nn) }, null, null)
@@ -828,8 +833,9 @@ class HdrTunerActivity : Activity() {
         pm.menu.add(0, 5, 1, if (BatchService.running) "Ajustando la galería…" else "Ajustar toda la galería")
         pm.menu.add(0, 3, 1, "Guardar ajustes")
         pm.menu.add(0, 4, 2, "Restaurar ajustes")
-        pm.menu.add(0, 2, 3, "Volver todo atrás")
-        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert(); 3 -> exportSettings(); 4 -> importSettings(); 5 -> confirmBatch() }; true }
+        pm.menu.add(0, 6, 3, "Papelera")
+        pm.menu.add(0, 2, 4, "Volver todo atrás")
+        pm.setOnMenuItemClickListener { when (it.itemId) { 1 -> showSettings(); 2 -> confirmRevert(); 3 -> exportSettings(); 4 -> importSettings(); 5 -> confirmBatch(); 6 -> showTrash() }; true }
         pm.show()
     }
 
@@ -844,7 +850,10 @@ class HdrTunerActivity : Activity() {
             append("• Grilla: lente · zoom · nivel, por ejemplo \"0.5x · zoom 1.8 · HDR 2.4\". El zoom aparece solo si la cámara recortó. En naranja, las que todavía no ajustó la app. Con \"Viendo\" filtrás por estado, lente y fecha.\n\n")
             append("• Vista previa: tocá una foto para verla en pantalla completa con el Ultra HDR real, probar el nivel con la barra y ver el detalle (por qué queda ese nivel: lente, zoom, escena). Mantené apretada la foto para ver cómo está ahora. Recién se guarda con \"Guardar copia\" o \"Reemplazar\".\n\n")
             append("• Varias fotos a la vez: mantené apretada una foto para empezar a elegir, tocá las demás (o \"Todas las que se ven\") y usá \"Guardar copia\" o \"Reemplazar\" de abajo.\n\n")
-            append("• Menú ⋮: Ajustes, Guardar ajustes y Restaurar ajustes (archivo en Descargas, para otro celular o al reinstalar) y Volver todo atrás.\n\n")
+            append("• Menú ⋮: Ajustes, Guardar ajustes y Restaurar ajustes (archivo en Descargas, para otro celular o al reinstalar), Papelera y Volver todo atrás.\n\n")
+            append("• Papelera: cuando la app cambia una foto original (automático, Ajustar toda la galería o Reemplazar), guarda lo necesario para dejarla exactamente como la sacó la cámara. " +
+                "No es una copia: ocupa unos bytes por foto (unos 300 KB si cambiaste el estilo), no aparece en la galería y se borra sola a los días que elijas. " +
+                "Las copias no la necesitan: el original queda intacto.\n\n")
             append("Ajustes actuales:\n")
             append("• Estilo: " + (if (HdrEngine.style(c) == "luces") "solo las luces" else "como la stock") + "\n")
             append("• Ultra HDR por lente: " + HdrEngine.Lens.values().joinToString(", ") { it.label + " " + (if (HdrEngine.lensOn(c, it)) "sí" else "no") } + "\n")
@@ -932,6 +941,158 @@ class HdrTunerActivity : Activity() {
             .show()
     }
 
+    // ------------------------------------------------------------------ papelera
+
+    private fun sizeText(b: Long) = when {
+        b < 1024 -> "$b bytes"
+        b < 1024 * 1024 -> "%.0f KB".format(b / 1024.0)
+        else -> "%.1f MB".format(b / 1024.0 / 1024.0)
+    }
+
+    private fun daysText(d: Int) = if (d <= 0) "apagada" else "$d días"
+
+    /** Lista de lo guardado, con Restaurar por foto, Restaurar todas, Vaciar y cuántos días se guarda. */
+    private fun showTrash() {
+        val c = this
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(4), dp(20), dp(8)) }
+        val daysRow = TextView(this).apply { textSize = 15f; typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(8), 0, dp(4)) }
+        val head = TextView(this).apply { textSize = 13f; setTextColor(Color.GRAY); setPadding(0, 0, 0, dp(10)) }
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        box.addView(daysRow); box.addView(head); box.addView(listBox)
+        val dlg = android.app.AlertDialog.Builder(this)
+            .setTitle("Papelera")
+            .setView(android.widget.ScrollView(this).apply { addView(box) })
+            .setPositiveButton("Cerrar", null)
+            .setNeutralButton("Vaciar", null)
+            .setNegativeButton("Restaurar todas", null)
+            .create()
+
+        var entries: List<Papelera.Entry> = emptyList()
+        val fmt = java.text.SimpleDateFormat("d/M HH:mm", java.util.Locale.getDefault())
+
+        fun fill() {
+            io.execute {
+                val list = Papelera.list(c)
+                val total = Papelera.totalBytes(c)
+                main.post {
+                    entries = list
+                    val d = Papelera.days(c)
+                    daysRow.text = "Guardar originales: ${daysText(d)} ▾"
+                    head.text = when {
+                        d <= 0 && list.isEmpty() -> "Apagada: no se guarda nada. Tocá arriba para prenderla."
+                        list.isEmpty() -> "Todavía no hay nada guardado. Se va llenando cuando la app cambia una foto original " +
+                            "(automático, Ajustar toda la galería o Reemplazar). Las copias no la necesitan: el original queda intacto."
+                        else -> "${list.size} foto(s) · ocupa ${sizeText(total)}. Cada una se puede dejar exactamente como la sacó la cámara, con su nombre. " +
+                            (if (d > 0) "Se borra sola a los $d días del último cambio." else "Apagada: no se guarda nada nuevo.")
+                    }
+                    listBox.removeAllViews()
+                    for (e in list) listBox.addView(trashRow(e, fmt) { confirmRestore(listOf(e)) { fill() } })
+                    dlg.getButton(android.app.AlertDialog.BUTTON_NEGATIVE)?.isEnabled = list.isNotEmpty()
+                    dlg.getButton(android.app.AlertDialog.BUTTON_NEUTRAL)?.isEnabled = list.isNotEmpty()
+                }
+            }
+        }
+
+        daysRow.setOnClickListener {
+            val opts = Papelera.DAY_OPTIONS
+            val labels: Array<CharSequence> = opts.map { (if (it == 0) "Apagada (no guardar)" else "$it días") as CharSequence }.toTypedArray()
+            android.app.AlertDialog.Builder(c)
+                .setTitle("Guardar originales")
+                .setSingleChoiceItems(labels, opts.indexOf(Papelera.days(c)).coerceAtLeast(0)) { d, which ->
+                    d.dismiss()
+                    val v = opts[which]
+                    if (v == 0 && entries.isNotEmpty()) {
+                        android.app.AlertDialog.Builder(c)
+                            .setTitle("¿Apagar la papelera?")
+                            .setMessage("No se va a guardar nada nuevo. Lo que ya está guardado (${entries.size} foto(s)) se puede vaciar ahora o dejar hasta que lo vacíes.")
+                            .setNegativeButton("Dejarlo") { _, _ -> Papelera.setDays(c, 0); fill() }
+                            .setPositiveButton("Vaciar") { _, _ -> Papelera.setDays(c, 0); Papelera.clear(c); fill() }
+                            .show()
+                    } else {
+                        Papelera.setDays(c, v)
+                        io.execute { Papelera.cleanup(c); main.post { fill() } }
+                    }
+                }
+                .show()
+        }
+
+        dlg.setOnShowListener {
+            dlg.getButton(android.app.AlertDialog.BUTTON_NEGATIVE).setOnClickListener { confirmRestore(entries) { fill() } }
+            dlg.getButton(android.app.AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                android.app.AlertDialog.Builder(c)
+                    .setTitle("¿Vaciar la papelera?")
+                    .setMessage("Las fotos quedan como están ahora. Lo que se borra es la posibilidad de volverlas a como las sacó la cámara " +
+                        "(\"Volver todo atrás\" sigue funcionando, pero rearma el Ultra HDR en vez de dejarlo idéntico).")
+                    .setNegativeButton("Cancelar", null)
+                    .setPositiveButton("Vaciar") { _, _ -> Papelera.clear(c); fill() }
+                    .show()
+            }
+        }
+        dlg.show()
+        fill()
+    }
+
+    private fun trashRow(e: Papelera.Entry, fmt: java.text.SimpleDateFormat, onRestore: () -> Unit): View {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(6), 0, dp(6)) }
+        val img = ImageView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(10) }
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            setBackgroundColor(Color.DKGRAY)
+        }
+        row.addView(img)
+        val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f) }
+        texts.addView(TextView(this).apply { text = e.name.ifEmpty { "(sin nombre)" }; textSize = 14f; maxLines = 1; ellipsize = android.text.TextUtils.TruncateAt.MIDDLE })
+        texts.addView(TextView(this).apply {
+            text = "cambiada el ${fmt.format(java.util.Date(e.updated))} · ${sizeText(e.fileSize)}"
+            textSize = 12f; setTextColor(Color.GRAY)
+        })
+        row.addView(texts)
+        row.addView(pillButton("Restaurar", Color.argb(255, 60, 60, 60), Color.WHITE) { onRestore() }.apply { textSize = 13f; setPadding(dp(12), dp(8), dp(12), dp(8)) })
+        Papelera.mediaUri(e)?.let { u ->
+            io.execute {
+                val b = try { contentResolver.loadThumbnail(u, Size(dp(112), dp(112)), null) } catch (_: Exception) { null }
+                if (b != null) main.post { img.setImageBitmap(b) }
+            }
+        }
+        return row
+    }
+
+    private fun confirmRestore(list: List<Papelera.Entry>, after: () -> Unit) {
+        if (list.isEmpty()) return
+        if (list.any { Papelera.mediaUri(it) != null } && !AutoHdr.canWrite()) {
+            status.text = "Para restaurar hace falta \"Acceso a todos los archivos\". Activalo y volvé a la Papelera."
+            try { startActivity(Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))) } catch (_: Exception) {}
+            return
+        }
+        val one = list.size == 1
+        android.app.AlertDialog.Builder(this)
+            .setTitle(if (one) "¿Restaurar esta foto?" else "¿Restaurar ${list.size} fotos?")
+            .setMessage((if (one) "La foto" else "Las fotos") + " vuelve" + (if (one) "" else "n") +
+                " a estar exactamente como la sacó la cámara, con su nombre original. Se sacan de la Papelera.")
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Restaurar") { _, _ ->
+                status.text = "Restaurando..."
+                io.execute {
+                    var ok = 0
+                    val fails = mutableListOf<String>()
+                    for ((k, e) in list.withIndex()) {
+                        main.post { status.text = "Restaurando... ${k + 1} de ${list.size}" }
+                        val why = try { Papelera.restore(this, e) } catch (ex: Exception) { ex.message ?: "error" }
+                        if (why == null) ok++ else fails += "${e.name}: $why"
+                    }
+                    main.post {
+                        status.text = buildString {
+                            append("Restauradas: $ok")
+                            if (fails.isNotEmpty()) append(" · no se pudieron: ${fails.size}\n" + fails.take(5).joinToString("\n"))
+                        }
+                        loadRecent()
+                        after()
+                    }
+                }
+            }
+            .show()
+    }
+
     // ------------------------------------------------------------------ volver todo atrás
 
     // ------------------------------------------------------------------ ajustar toda la galería
@@ -950,7 +1111,8 @@ class HdrTunerActivity : Activity() {
                     .setTitle("¿Ajustar toda la galería?")
                     .setMessage("Se van a revisar las $n fotos de la cámara (DCIM) y a cada una se le pone el nivel que calcula la app con tus ajustes actuales: " +
                         "nivel ×%.1f, Ultra HDR por lente, nivel por lente, zoom, escena y estilo. Es lo mismo que haría el automático si la sacaras ahora.\n\n".format(target) +
-                        "Se modifican las fotos originales (no son copias) y se agrega el nivel al nombre. Se puede deshacer con \"Volver todo atrás\".\n\n" +
+                        "Se modifican las fotos originales (no son copias) y se agrega el nivel al nombre. Se puede deshacer con \"Volver todo atrás\"" +
+                        (if (Papelera.days(this) > 0) ", y cada original queda en la Papelera (menú ⋮) durante ${Papelera.days(this)} días.\n\n" else ".\n\n") +
                         "Puede tardar varios minutos. Sigue aunque cierres la app, y te aviso con una notificación cuando termine.")
                     .setNegativeButton("Cancelar", null)
                     .setPositiveButton("Ajustar todas") { _, _ ->
@@ -982,6 +1144,7 @@ class HdrTunerActivity : Activity() {
             .setTitle("¿Volver todo atrás?")
             .setMessage("Las fotos de la cámara que ajustó Nivel HDR (las que tienen _HDRx en el nombre) quedan como las guardó la cámara: " +
                 "las de la x1 vuelven a ×4.93 y a las de x0.5, x3 y frontal se les saca el Ultra HDR. También se saca el nivel del nombre. " +
+                "Las que están en la Papelera vuelven exactas, byte a byte. " +
                 "Las copias guardadas no se tocan. El automático sigue como está.")
             .setNegativeButton("Cancelar", null)
             .setPositiveButton("Volver atrás") { _, _ -> doRevert() }

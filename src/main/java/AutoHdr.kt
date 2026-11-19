@@ -124,7 +124,12 @@ object AutoHdr {
         val src = f.readBytes()
         val r = HdrEngine.render(ctx, src, rel.startsWith("DCIM/Camera"), lensRules = true) ?: return ONE_SKIPPED to f.path
         var res = ONE_SAME
-        if (r.kind != "igual") { writeBytes(f, src, r.bytes); res = ONE_CHANGED }
+        if (r.kind != "igual") {
+            // antes de tocar el original, lo necesario para dejarlo como estaba (Papelera)
+            val uri = android.content.ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+            Papelera.record(ctx, Papelera.keyOf(id), src, r.bytes, f.name, uri.toString())
+            writeBytes(f, src, r.bytes); res = ONE_CHANGED
+        }
         val newPath = renameWithLevel(ctx, id, f, r.boost) // el nivel queda en el nombre
         return res to (newPath ?: f.path)
     }
@@ -241,9 +246,13 @@ object AutoHdr {
             try {
                 val f = File(e.second)
                 val src = f.readBytes()
-                HdrEngine.revert(src)?.let { writeBytes(f, src, it) }
+                // si está en la Papelera, vuelve exacta (byte a byte, con su nombre); si no, se rearma como la cámara
+                val key = Papelera.keyOf(e.first)
+                val saved = Papelera.original(ctx, key, src)
+                if (saved != null) { writeBytes(f, src, saved.first); Papelera.remove(ctx, key) }
+                else HdrEngine.revert(src)?.let { writeBytes(f, src, it) }
                 // sacar el sufijo del nombre
-                val clean = SUFFIX.replace(f.nameWithoutExtension, "") + "." + f.extension
+                val clean = saved?.second ?: (SUFFIX.replace(f.nameWithoutExtension, "") + "." + f.extension)
                 var p = f.path
                 if (clean != f.name) {
                     val uri = android.content.ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, e.first)
@@ -266,7 +275,10 @@ class AutoHdrJob : JobService() {
     override fun onStartJob(params: JobParameters): Boolean {
         Thread {
             try { if (AutoHdr.processNew(applicationContext) > 0) AutoHdrService.refresh(applicationContext) } catch (_: Throwable) {}
-            if (params.jobId == 4932) AutoHdr.ensure(applicationContext) // la revisión periódica levanta el servicio si se cayó
+            if (params.jobId == 4932) {
+                AutoHdr.ensure(applicationContext) // la revisión periódica levanta el servicio si se cayó
+                try { Papelera.cleanup(applicationContext) } catch (_: Throwable) {} // borra lo vencido
+            }
             // el disparador de contenido sirve una sola vez: se vuelve a programar
             if (AutoHdr.isOn(applicationContext)) AutoHdr.schedule(applicationContext)
             jobFinished(params, false)
